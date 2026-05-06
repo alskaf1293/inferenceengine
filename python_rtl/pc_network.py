@@ -138,6 +138,8 @@ class Layer:
                  winit_matrix: np.ndarray,
                  phi: str = 'linear',
                  wclip: float = 20.0,
+                 xclip: Optional[float] = None,
+                 eps_clip: Optional[float] = None,
                  gamma: float = 0.1,
                  alpha: float = 0.05,
                  bias_lr_scale: float = 1.0,
@@ -146,6 +148,9 @@ class Layer:
         self.k = k; self.n = n; self.m = m
         self.phi_fn = get_phi(phi)
         self.wclip = wclip; self.gamma = gamma; self.alpha = alpha; self.bls = bias_lr_scale
+        self.xclip = xclip
+        self.eps_clip = eps_clip
+        self.x_init = x_init
 
         self.W    = np.asarray(winit_matrix, dtype=np.float64)   # (k, n)
         self.bias = np.zeros(k, dtype=np.float64) if bias_init is None else np.asarray(bias_init, dtype=np.float64)
@@ -156,6 +161,11 @@ class Layer:
     def set_rates(self, alpha: float, gamma: float) -> None:
         self.alpha = alpha
         self.gamma = gamma
+
+    def reset_state(self) -> None:
+        self.x_state.fill(self.x_init)
+        self.eps.fill(0.0)
+        self.back_kn.fill(0.0)
 
     def tick(self,
              x_up:          np.ndarray,   # from layer above, shape (n,) or (0,)
@@ -183,6 +193,8 @@ class Layer:
 
         # S_ERR
         eps = x_eff - mu                                 # shape (k,)
+        if self.eps_clip is not None:
+            eps = np.clip(eps, -self.eps_clip, self.eps_clip)
 
         # S_BACKSUM: phi'(x_eff) · sum_j(back_from_down[i, j])
         _, phi_prime = self.phi_fn(x_eff)               # shape (k,)
@@ -196,14 +208,16 @@ class Layer:
         if self.n > 0:
             self.back_kn = self.W * eps[:, np.newaxis]  # (k, n) broadcast
 
-        # S_WUP: W[i, :] += alpha * eps[i] * phi_xup
+        # S_WUP: W[i, :] += alpha * eps[i] * phi_xup  (clipped to ±wclip)
         mi = self.alpha * eps                            # shape (k,)
         if self.n > 0:
-            self.W = self.W + np.outer(mi, phi_xup)
-        self.bias = self.bias + mi * self.bls
+            self.W = np.clip(self.W + np.outer(mi, phi_xup), -self.wclip, self.wclip)
+        self.bias = np.clip(self.bias + mi * self.bls, -self.wclip, self.wclip)
 
         # S_STATE: clamped → x_obs; free → x + gamma*(back_eff - eps)
         new_x = self.x_state + self.gamma * (back_eff - eps)
+        if self.xclip is not None:
+            new_x = np.clip(new_x, -self.xclip, self.xclip)
         self.x_state = np.where(clamp_vec, obs_vec, new_x)
         self.eps = eps
 
@@ -244,6 +258,8 @@ class PCNet3Layer:
     """
     def __init__(self, k_lut: list[int], act_lut: list[str],
                  wclip: float = 20.0,
+                 xclip_lut: Optional[list[Optional[float]]] = None,
+                 eps_clip_lut: Optional[list[Optional[float]]] = None,
                  gamma: float = 0.1,
                  alpha: float = 0.05,
                  bias_lr_scale: float = 1.0,
@@ -267,6 +283,9 @@ class PCNet3Layer:
         assert len(k_lut) == 3 and len(act_lut) == 3
         k0, k1, k2 = k_lut
         self.k_lut = k_lut
+        xclip_lut = [None, None, None] if xclip_lut is None else list(xclip_lut)
+        eps_clip_lut = [None, None, None] if eps_clip_lut is None else list(eps_clip_lut)
+        assert len(xclip_lut) == 3 and len(eps_clip_lut) == 3
 
         rng = np.random.default_rng(seed if seed is not None else 0)
         gk = gen_k_lut if gen_k_lut is not None else k_lut
@@ -300,19 +319,26 @@ class PCNet3Layer:
 
         # layer 0: bottom (k0 neurons, n=k1 presynaptic from layer 1, m=0)
         self.layer0 = Layer(k0, k1, 0,  rinit(0),  act_lut[0],
-                            wclip, gamma, alpha, bias_lr_scale, x_init=float(x_init),
+                            wclip, xclip_lut[0], eps_clip_lut[0],
+                            gamma, alpha, bias_lr_scale, x_init=float(x_init),
                             bias_init=binit(k0))
         # layer 1: hidden (k1 neurons, n=k2 presynaptic from layer 2, m=k0 back from layer 0)
         self.layer1 = Layer(k1, k2, k0, rinit(1),  act_lut[1],
-                            wclip, gamma, alpha, bias_lr_scale, x_init=float(x_init),
+                            wclip, xclip_lut[1], eps_clip_lut[1],
+                            gamma, alpha, bias_lr_scale, x_init=float(x_init),
                             bias_init=binit(k1))
         # layer 2: top (k2 neurons, n=0 no presynaptic above, m=k1 back from layer 1)
         self.layer2 = Layer(k2, 0,  k1, np.zeros((k2, 0)), act_lut[2],
-                            wclip, gamma, alpha, bias_lr_scale, x_init=float(x_init))
+                            wclip, xclip_lut[2], eps_clip_lut[2],
+                            gamma, alpha, bias_lr_scale, x_init=float(x_init))
 
     def set_rates(self, alpha: float, gamma: float) -> None:
         for layer in (self.layer0, self.layer1, self.layer2):
             layer.set_rates(alpha, gamma)
+
+    def reset_state(self) -> None:
+        for layer in (self.layer0, self.layer1, self.layer2):
+            layer.reset_state()
 
     def tick(self,
              x_top:        np.ndarray,           # input, shape (k2,)

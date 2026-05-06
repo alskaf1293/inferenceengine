@@ -1,5 +1,15 @@
+.DS_Store
 gen_theta_init_pkg.py
 main.py
 
 archive/
 obj_dir/
+
+python_runs/
+python_rtl/python_runs/
+
+amortizedEFE.pdf
+backpropequivalence.pdf
+mypaper.pdf
+platonicrepresentation.pdf
+schmidtproposal.pdf
