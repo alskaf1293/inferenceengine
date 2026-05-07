@@ -147,8 +147,15 @@ class PCValueModel:
         max_infer_ticks: int,
         max_query_ticks: int,
         value_scale: float = 100.0,
-        value_clip: float = 5.0,
+        value_clip: Optional[float] = None,
+        hidden_clip: Optional[float] = None,
+        eps_clip: Optional[float] = None,
+        init: str = 'from_bp',
+        device: Optional[torch.device] = None,
+        optimizer: str = 'adam',
+        trace_scale: float = 1.0,
     ):
+        set_seed(seed)
         self.discount = discount
         self.lr = lr
         self.gamma_pc = gamma_pc
@@ -160,38 +167,100 @@ class PCValueModel:
         self.max_infer_ticks = max_infer_ticks
         self.max_query_ticks = max_query_ticks
         self.value_scale = value_scale
+        self.optimizer = optimizer
+        self.trace_scale = trace_scale
+        self.device = device if device is not None else torch.device('cpu')
         self.net = PCNet3Layer(
             k_lut=[ACTION_SIZE, hidden, STATE_SIZE],
-            act_lut=['linear', 'relu', 'linear'],
+            # PCNet applies each layer activation to inputs from the layer above.
+            # This corresponds to BP's Linear(input)->ReLU(hidden)->Linear(output).
+            act_lut=['relu', 'linear', 'linear'],
             wclip=20.0,
-            xclip_lut=[value_clip, 10.0, None],
-            eps_clip_lut=[1.0, 1.0, 1.0],
+            xclip_lut=[value_clip, hidden_clip, None],
+            eps_clip_lut=[eps_clip, eps_clip, eps_clip],
             gamma=gamma_pc,
             alpha=lr,
             seed=seed,
             rtl_init=False,
             gen_k_lut=None,
         )
+        self._init_weights(init, seed, hidden, device)
         self._target_W0 = self.net.layer0.W.copy()
         self._target_b0 = self.net.layer0.bias.copy()
         self._target_W1 = self.net.layer1.W.copy()
         self._target_b1 = self.net.layer1.bias.copy()
         self.last_loss = 0.0
+        self.settle_calls = 0
+        self.settle_ticks = 0
+        self.settle_cap_hits = 0
+        self.settle_final_delta = 0.0
+        self._adam_t = 0
+        self._adam_m = {
+            'W0': np.zeros((ACTION_SIZE, hidden), dtype=np.float64),
+            'b0': np.zeros(ACTION_SIZE, dtype=np.float64),
+            'W1': np.zeros((hidden, STATE_SIZE), dtype=np.float64),
+            'b1': np.zeros(hidden, dtype=np.float64),
+        }
+        self._adam_v = {k: np.zeros_like(v) for k, v in self._adam_m.items()}
+
+    def _init_weights(self, init: str, seed: int, hidden: int, device: Optional[torch.device]) -> None:
+        if init == 'pc':
+            return
+        if init == 'from_bp':
+            bp = BPMLP(STATE_SIZE, hidden, ACTION_SIZE)
+            if device is not None:
+                bp = bp.to(device)
+            with torch.no_grad():
+                self.net.layer1.W = bp.fc1.weight.detach().cpu().numpy().astype(np.float64).copy()
+                self.net.layer1.bias = bp.fc1.bias.detach().cpu().numpy().astype(np.float64).copy()
+                self.net.layer0.W = bp.fc2.weight.detach().cpu().numpy().astype(np.float64).copy()
+                self.net.layer0.bias = bp.fc2.bias.detach().cpu().numpy().astype(np.float64).copy()
+            return
+        if init != 'xavier':
+            raise ValueError(f"Unknown PC init '{init}'")
+        rng = np.random.default_rng(seed)
+
+        def xavier(shape: tuple[int, int]) -> np.ndarray:
+            fan_out, fan_in = shape
+            bound = np.sqrt(6.0 / float(fan_in + fan_out))
+            return rng.uniform(-bound, bound, size=shape)
+
+        self.net.layer1.W = xavier((self.net.layer1.k, self.net.layer1.n))
+        self.net.layer1.bias.fill(0.0)
+        self.net.layer0.W = xavier((self.net.layer0.k, self.net.layer0.n))
+        self.net.layer0.bias.fill(0.0)
 
     def _run_ticks(self, state: np.ndarray, y_bottom: Optional[np.ndarray],
                    clamp_bottom: bool, n_ticks: int, max_ticks: int) -> None:
         total_ticks = n_ticks if not self.adaptive_inference else max(n_ticks, max_ticks)
+        final_delta = float('inf')
+        ticks_used = 0
         for ticks_run in range(total_ticks):
             prev_hidden = self.net.layer1.x_state.copy()
             prev_bottom = None if clamp_bottom else self.net.layer0.x_state.copy()
             self.net.tick(state, y_bottom, clamp_top=True, clamp_bottom=clamp_bottom)
+            ticks_used = ticks_run + 1
             if not self.adaptive_inference or ticks_run + 1 < n_ticks:
                 continue
             max_delta = float(np.max(np.abs(self.net.layer1.x_state - prev_hidden)))
             if prev_bottom is not None:
                 max_delta = max(max_delta, float(np.max(np.abs(self.net.layer0.x_state - prev_bottom))))
+            final_delta = max_delta
             if max_delta <= self.settle_tol:
                 break
+        self.settle_calls += 1
+        self.settle_ticks += ticks_used
+        self.settle_cap_hits += int(self.adaptive_inference and ticks_used >= total_ticks and final_delta > self.settle_tol)
+        if final_delta != float('inf'):
+            self.settle_final_delta += final_delta
+
+    def diagnostics(self) -> dict[str, float]:
+        calls = max(1, self.settle_calls)
+        return {
+            'pc_value_settle_avg_ticks': self.settle_ticks / calls,
+            'pc_value_settle_cap_rate': self.settle_cap_hits / calls,
+            'pc_value_settle_avg_delta': self.settle_final_delta / calls,
+        }
 
     def _query_state(self, state: np.ndarray, target: bool = False) -> np.ndarray:
         l0_x = self.net.layer0.x_state.copy()
@@ -239,12 +308,79 @@ class PCValueModel:
         for _ in range(self.n_learn):
             self.net.tick(np.asarray(state, dtype=np.float64), target_norm, clamp_top=True, clamp_bottom=True)
 
+    def _pc_gradient_single(self, state: np.ndarray, target_vec_raw: np.ndarray) -> dict[str, np.ndarray]:
+        target_norm = np.asarray(target_vec_raw, dtype=np.float64) / self.value_scale
+        state64 = np.asarray(state, dtype=np.float64)
+        self.net.reset_state()
+        self.net.set_rates(alpha=0.0, gamma=self.gamma_pc)
+        self._run_ticks(state64, target_norm, True, self.n_infer, self.max_infer_ticks)
+        hidden_phi, _ = self.net.layer0.phi_fn(self.net.layer1.x_state)
+        input_phi, _ = self.net.layer1.phi_fn(self.net.layer2.x_state)
+        # PC local increments are +eps*phi. Adam expects dL/dtheta, so negate.
+        return {
+            'W0': -np.outer(self.net.layer0.eps, hidden_phi),
+            'b0': -self.net.layer0.eps.copy(),
+            'W1': -np.outer(self.net.layer1.eps, input_phi),
+            'b1': -self.net.layer1.eps.copy(),
+        }
+
+    def _apply_adam(self, grads: dict[str, np.ndarray]) -> None:
+        self._adam_t += 1
+        beta1, beta2, eps = 0.9, 0.999, 1e-8
+        params = {
+            'W0': self.net.layer0.W,
+            'b0': self.net.layer0.bias,
+            'W1': self.net.layer1.W,
+            'b1': self.net.layer1.bias,
+        }
+        for key, param in params.items():
+            grad = grads[key]
+            self._adam_m[key] = beta1 * self._adam_m[key] + (1.0 - beta1) * grad
+            self._adam_v[key] = beta2 * self._adam_v[key] + (1.0 - beta2) * (grad * grad)
+            m_hat = self._adam_m[key] / (1.0 - beta1 ** self._adam_t)
+            v_hat = self._adam_v[key] / (1.0 - beta2 ** self._adam_t)
+            param -= self.lr * m_hat / (np.sqrt(v_hat) + eps)
+            np.clip(param, -self.net.layer0.wclip, self.net.layer0.wclip, out=param)
+
+    def _apply_local_trace(self, grads: dict[str, np.ndarray]) -> None:
+        beta1, beta2, eps = 0.9, 0.999, 1e-6
+        params = {
+            'W0': self.net.layer0.W,
+            'b0': self.net.layer0.bias,
+            'W1': self.net.layer1.W,
+            'b1': self.net.layer1.bias,
+        }
+        for key, param in params.items():
+            grad = grads[key]
+            self._adam_m[key] = beta1 * self._adam_m[key] + (1.0 - beta1) * grad
+            self._adam_v[key] = beta2 * self._adam_v[key] + (1.0 - beta2) * (grad * grad)
+            param -= self.trace_scale * self.lr * self._adam_m[key] / (np.sqrt(self._adam_v[key]) + eps)
+            np.clip(param, -self.net.layer0.wclip, self.net.layer0.wclip, out=param)
+
+    def _learn_batch_adam(self, states: np.ndarray, targets_raw: np.ndarray) -> None:
+        grads = {
+            'W0': np.zeros_like(self.net.layer0.W),
+            'b0': np.zeros_like(self.net.layer0.bias),
+            'W1': np.zeros_like(self.net.layer1.W),
+            'b1': np.zeros_like(self.net.layer1.bias),
+        }
+        for state, target_vec in zip(states, targets_raw):
+            sample_grads = self._pc_gradient_single(state, target_vec)
+            for key in grads:
+                grads[key] += sample_grads[key]
+        scale = 1.0 / max(1, len(states))
+        for key in grads:
+            grads[key] *= scale
+        self._apply_adam(grads)
+
     def replay_update(self, memory: list[tuple[np.ndarray, int, float, np.ndarray, bool]],
                       policy_model: 'PolicyModel') -> float:
         if not memory:
             return 0.0
         batch_size = min(BATCH_SIZE, len(memory))
         minibatch = random.sample(memory, batch_size)
+        states = []
+        targets_raw = []
         losses = []
         for state, action, reward, next_state, done in minibatch:
             target = float(reward)
@@ -255,7 +391,14 @@ class PCValueModel:
             current = self.predict_np(np.asarray(state, dtype=np.float64), target=False)[0]
             losses.append(abs(target - current[action]))
             current[action] = target
-            self._learn_single(state, current)
+            states.append(np.asarray(state, dtype=np.float64))
+            targets_raw.append(current)
+            if self.optimizer == 'hebbian':
+                self._learn_single(state, current)
+            elif self.optimizer == 'trace':
+                self._apply_local_trace(self._pc_gradient_single(state, current))
+        if self.optimizer == 'adam' and states:
+            self._learn_batch_adam(np.stack(states), np.stack(targets_raw))
         self.last_loss = float(np.mean(losses)) if losses else 0.0
         return self.last_loss
 
@@ -343,8 +486,15 @@ class PCPolicyModel:
         max_infer_ticks: int,
         max_query_ticks: int,
         policy_clip: float = 5.0,
+        hidden_clip: Optional[float] = None,
         smoothing: float = 0.02,
+        eps_clip: Optional[float] = None,
+        init: str = 'from_bp',
+        device: Optional[torch.device] = None,
+        optimizer: str = 'adam',
+        trace_scale: float = 1.0,
     ):
+        set_seed(seed)
         self.lr = lr
         self.gamma_pc = gamma_pc
         self.n_infer = n_infer
@@ -356,34 +506,94 @@ class PCPolicyModel:
         self.max_query_ticks = max_query_ticks
         self.policy_clip = policy_clip
         self.smoothing = smoothing
+        self.optimizer = optimizer
+        self.trace_scale = trace_scale
+        self.device = device if device is not None else torch.device('cpu')
         self.net = PCNet3Layer(
             k_lut=[ACTION_SIZE, hidden, STATE_SIZE],
-            act_lut=['linear', 'relu', 'linear'],
+            act_lut=['relu', 'linear', 'linear'],
             wclip=20.0,
-            xclip_lut=[policy_clip, 10.0, None],
-            eps_clip_lut=[1.0, 1.0, 1.0],
+            xclip_lut=[policy_clip, hidden_clip, None],
+            eps_clip_lut=[eps_clip, eps_clip, eps_clip],
             gamma=gamma_pc,
             alpha=lr,
             seed=seed,
             rtl_init=False,
             gen_k_lut=None,
         )
+        self._init_weights(init, seed, hidden, device)
         self.last_loss = 0.0
+        self.settle_calls = 0
+        self.settle_ticks = 0
+        self.settle_cap_hits = 0
+        self.settle_final_delta = 0.0
+        self._adam_t = 0
+        self._adam_m = {
+            'W0': np.zeros((ACTION_SIZE, hidden), dtype=np.float64),
+            'b0': np.zeros(ACTION_SIZE, dtype=np.float64),
+            'W1': np.zeros((hidden, STATE_SIZE), dtype=np.float64),
+            'b1': np.zeros(hidden, dtype=np.float64),
+        }
+        self._adam_v = {k: np.zeros_like(v) for k, v in self._adam_m.items()}
+
+    def _init_weights(self, init: str, seed: int, hidden: int, device: Optional[torch.device]) -> None:
+        if init == 'pc':
+            return
+        if init == 'from_bp':
+            bp = BPMLP(STATE_SIZE, hidden, ACTION_SIZE)
+            if device is not None:
+                bp = bp.to(device)
+            with torch.no_grad():
+                self.net.layer1.W = bp.fc1.weight.detach().cpu().numpy().astype(np.float64).copy()
+                self.net.layer1.bias = bp.fc1.bias.detach().cpu().numpy().astype(np.float64).copy()
+                self.net.layer0.W = bp.fc2.weight.detach().cpu().numpy().astype(np.float64).copy()
+                self.net.layer0.bias = bp.fc2.bias.detach().cpu().numpy().astype(np.float64).copy()
+            return
+        if init != 'xavier':
+            raise ValueError(f"Unknown PC init '{init}'")
+        rng = np.random.default_rng(seed)
+
+        def xavier(shape: tuple[int, int]) -> np.ndarray:
+            fan_out, fan_in = shape
+            bound = np.sqrt(6.0 / float(fan_in + fan_out))
+            return rng.uniform(-bound, bound, size=shape)
+
+        self.net.layer1.W = xavier((self.net.layer1.k, self.net.layer1.n))
+        self.net.layer1.bias.fill(0.0)
+        self.net.layer0.W = xavier((self.net.layer0.k, self.net.layer0.n))
+        self.net.layer0.bias.fill(0.0)
 
     def _run_ticks(self, state: np.ndarray, y_bottom: Optional[np.ndarray],
                    clamp_bottom: bool, n_ticks: int, max_ticks: int) -> None:
         total_ticks = n_ticks if not self.adaptive_inference else max(n_ticks, max_ticks)
+        final_delta = float('inf')
+        ticks_used = 0
         for ticks_run in range(total_ticks):
             prev_hidden = self.net.layer1.x_state.copy()
             prev_bottom = None if clamp_bottom else self.net.layer0.x_state.copy()
             self.net.tick(state, y_bottom, clamp_top=True, clamp_bottom=clamp_bottom)
+            ticks_used = ticks_run + 1
             if not self.adaptive_inference or ticks_run + 1 < n_ticks:
                 continue
             max_delta = float(np.max(np.abs(self.net.layer1.x_state - prev_hidden)))
             if prev_bottom is not None:
                 max_delta = max(max_delta, float(np.max(np.abs(self.net.layer0.x_state - prev_bottom))))
+            final_delta = max_delta
             if max_delta <= self.settle_tol:
                 break
+        self.settle_calls += 1
+        self.settle_ticks += ticks_used
+        self.settle_cap_hits += int(self.adaptive_inference and ticks_used >= total_ticks and final_delta > self.settle_tol)
+        if final_delta != float('inf'):
+            self.settle_final_delta += final_delta
+
+    def diagnostics(self) -> dict[str, float]:
+        calls = max(1, self.settle_calls)
+        return {
+            'pc_policy_settle_avg_ticks': self.settle_ticks / calls,
+            'pc_policy_settle_cap_rate': self.settle_cap_hits / calls,
+            'pc_policy_settle_avg_delta': self.settle_final_delta / calls,
+        }
 
     def _query_state(self, state: np.ndarray) -> np.ndarray:
         l0_x = self.net.layer0.x_state.copy()
@@ -412,7 +622,8 @@ class PCPolicyModel:
 
     def sample_action(self, state: np.ndarray) -> int:
         probs = self.probs_np(np.asarray(state, dtype=np.float64))[0]
-        return int(np.random.choice(ACTION_SIZE, p=probs))
+        probs_t = torch.as_tensor(probs, dtype=torch.float32, device=self.device)
+        return sample_action_from_probs(probs_t)
 
     def _target_logits_from_values(self, values: np.ndarray) -> np.ndarray:
         greedy = int(np.argmax(values))
@@ -431,7 +642,115 @@ class PCPolicyModel:
         for _ in range(self.n_learn):
             self.net.tick(np.asarray(state, dtype=np.float64), target, clamp_top=True, clamp_bottom=True)
 
+    def _policy_loss_grad(self, logits: np.ndarray, values: np.ndarray) -> tuple[float, np.ndarray]:
+        probs = softmax_np(logits)
+        value_log_probs = np.asarray(values, dtype=np.float64)
+        value_log_probs = value_log_probs - np.max(value_log_probs)
+        value_log_probs = value_log_probs - np.log(np.sum(np.exp(value_log_probs)))
+        expected = float(np.dot(probs, value_log_probs))
+        loss = -expected
+        grad_logits = probs * (expected - value_log_probs)
+        return loss, grad_logits
+
+    def _pc_gradient_single(self, state: np.ndarray, values: np.ndarray) -> tuple[float, dict[str, np.ndarray]]:
+        state64 = np.asarray(state, dtype=np.float64)
+        logits = self._query_state(state64)
+        loss, grad_logits = self._policy_loss_grad(logits, values)
+        # A bottom target of z - dL/dz makes eps = -dL/dz, so PC local
+        # increments encode the negative gradient.
+        target = logits - grad_logits
+        self.net.reset_state()
+        self.net.set_rates(alpha=0.0, gamma=self.gamma_pc)
+        self._run_ticks(state64, target, True, self.n_infer, self.max_infer_ticks)
+        hidden_phi, _ = self.net.layer0.phi_fn(self.net.layer1.x_state)
+        input_phi, _ = self.net.layer1.phi_fn(self.net.layer2.x_state)
+        return loss, {
+            'W0': -np.outer(self.net.layer0.eps, hidden_phi),
+            'b0': -self.net.layer0.eps.copy(),
+            'W1': -np.outer(self.net.layer1.eps, input_phi),
+            'b1': -self.net.layer1.eps.copy(),
+        }
+
+    def _apply_adam(self, grads: dict[str, np.ndarray]) -> None:
+        self._adam_t += 1
+        beta1, beta2, eps = 0.9, 0.999, 1e-8
+        params = {
+            'W0': self.net.layer0.W,
+            'b0': self.net.layer0.bias,
+            'W1': self.net.layer1.W,
+            'b1': self.net.layer1.bias,
+        }
+        for key, param in params.items():
+            grad = grads[key]
+            self._adam_m[key] = beta1 * self._adam_m[key] + (1.0 - beta1) * grad
+            self._adam_v[key] = beta2 * self._adam_v[key] + (1.0 - beta2) * (grad * grad)
+            m_hat = self._adam_m[key] / (1.0 - beta1 ** self._adam_t)
+            v_hat = self._adam_v[key] / (1.0 - beta2 ** self._adam_t)
+            param -= self.lr * m_hat / (np.sqrt(v_hat) + eps)
+            np.clip(param, -self.net.layer0.wclip, self.net.layer0.wclip, out=param)
+
+    def _apply_local_trace(self, grads: dict[str, np.ndarray]) -> None:
+        beta1, beta2, eps = 0.9, 0.999, 1e-6
+        params = {
+            'W0': self.net.layer0.W,
+            'b0': self.net.layer0.bias,
+            'W1': self.net.layer1.W,
+            'b1': self.net.layer1.bias,
+        }
+        for key, param in params.items():
+            grad = grads[key]
+            self._adam_m[key] = beta1 * self._adam_m[key] + (1.0 - beta1) * grad
+            self._adam_v[key] = beta2 * self._adam_v[key] + (1.0 - beta2) * (grad * grad)
+            param -= self.trace_scale * self.lr * self._adam_m[key] / (np.sqrt(self._adam_v[key]) + eps)
+            np.clip(param, -self.net.layer0.wclip, self.net.layer0.wclip, out=param)
+
+    def _update_histories_adam(self, histories: list[History], value_model: object) -> float:
+        grads = {
+            'W0': np.zeros_like(self.net.layer0.W),
+            'b0': np.zeros_like(self.net.layer0.bias),
+            'W1': np.zeros_like(self.net.layer1.W),
+            'b1': np.zeros_like(self.net.layer1.bias),
+        }
+        losses = []
+        n = 0
+        for hist in histories:
+            if not hist.states:
+                continue
+            states = np.asarray(hist.states, dtype=np.float64)
+            values_batch = value_model.predict_np(states)
+            for state, values in zip(states, values_batch):
+                loss, sample_grads = self._pc_gradient_single(state, values)
+                losses.append(loss)
+                n += 1
+                for key in grads:
+                    grads[key] += sample_grads[key]
+        if n:
+            scale = 1.0 / n
+            for key in grads:
+                grads[key] *= scale
+            self._apply_adam(grads)
+        return float(np.mean(losses)) if losses else 0.0
+
+    def _update_histories_trace(self, histories: list[History], value_model: object) -> float:
+        losses = []
+        for hist in histories:
+            if not hist.states:
+                continue
+            states = np.asarray(hist.states, dtype=np.float64)
+            values_batch = value_model.predict_np(states)
+            for state, values in zip(states, values_batch):
+                loss, sample_grads = self._pc_gradient_single(state, values)
+                losses.append(loss)
+                self._apply_local_trace(sample_grads)
+        return float(np.mean(losses)) if losses else 0.0
+
     def update_histories(self, histories: list[History], value_model: object) -> float:
+        if self.optimizer == 'adam':
+            self.last_loss = self._update_histories_adam(histories, value_model)
+            return self.last_loss
+        if self.optimizer == 'trace':
+            self.last_loss = self._update_histories_trace(histories, value_model)
+            return self.last_loss
         losses = []
         for hist in histories:
             for state in hist.states:
@@ -463,6 +782,12 @@ def make_models(args: argparse.Namespace, device: torch.device):
             max_query_ticks=args.max_query_ticks,
             value_scale=args.pc_value_scale,
             value_clip=args.pc_value_clip,
+            hidden_clip=args.pc_hidden_clip,
+            eps_clip=args.pc_eps_clip,
+            init=args.pc_init,
+            device=device,
+            optimizer=args.pc_optimizer,
+            trace_scale=args.pc_trace_scale,
         )
     if args.policy_backend == 'bp':
         policy_model = BPPolicyModel(args.hidden, args.lr_policy, args.seed + 1, device)
@@ -480,7 +805,13 @@ def make_models(args: argparse.Namespace, device: torch.device):
             max_infer_ticks=args.max_infer_ticks,
             max_query_ticks=args.max_query_ticks,
             policy_clip=args.pc_policy_clip,
+            hidden_clip=args.pc_hidden_clip,
             smoothing=args.pc_policy_smoothing,
+            eps_clip=args.pc_eps_clip,
+            init=args.pc_init,
+            device=device,
+            optimizer=args.pc_optimizer,
+            trace_scale=args.pc_trace_scale,
         )
     return value_model, policy_model
 
@@ -506,7 +837,11 @@ def main(args: argparse.Namespace) -> tuple[list[int], list[float], list[float]]
     with open(args.out_csv, 'w', newline='') as f:
         writer = csv.writer(f)
         writer.writerow(['episode', 'reward', 'avg_reward_ema', 'policy_loss', 'value_loss',
-                         'value_backend', 'policy_backend'])
+                         'value_backend', 'policy_backend',
+                         'pc_value_settle_avg_ticks', 'pc_value_settle_cap_rate',
+                         'pc_value_settle_avg_delta',
+                         'pc_policy_settle_avg_ticks', 'pc_policy_settle_cap_rate',
+                         'pc_policy_settle_avg_delta'])
 
         for episode in range(1, args.episodes + 1):
             obs, _ = env.reset()
@@ -561,8 +896,17 @@ def main(args: argparse.Namespace) -> tuple[list[int], list[float], list[float]]
             rewards.append(int(episode_reward))
             plosses.append(float(ploss))
             vlosses.append(float(vloss))
+            diag = value_model.diagnostics() if hasattr(value_model, 'diagnostics') else {}
+            if hasattr(policy_model, 'diagnostics'):
+                diag.update(policy_model.diagnostics())
             writer.writerow([episode, episode_reward, avgreward, plosses[-1], vlosses[-1],
-                             args.value_backend, args.policy_backend])
+                             args.value_backend, args.policy_backend,
+                             diag.get('pc_value_settle_avg_ticks', ''),
+                             diag.get('pc_value_settle_cap_rate', ''),
+                             diag.get('pc_value_settle_avg_delta', ''),
+                             diag.get('pc_policy_settle_avg_ticks', ''),
+                             diag.get('pc_policy_settle_cap_rate', ''),
+                             diag.get('pc_policy_settle_avg_delta', '')])
 
     env.close()
     return rewards, plosses, vlosses
@@ -592,10 +936,15 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument('--max-infer-ticks', type=int, default=200)
     ap.add_argument('--max-query-ticks', type=int, default=300)
     ap.add_argument('--no-adaptive-inference', action='store_true')
-    ap.add_argument('--pc-value-scale', type=float, default=100.0)
-    ap.add_argument('--pc-value-clip', type=float, default=5.0)
+    ap.add_argument('--pc-value-scale', type=float, default=1.0)
+    ap.add_argument('--pc-value-clip', type=float, default=None)
+    ap.add_argument('--pc-hidden-clip', type=float, default=None)
     ap.add_argument('--pc-policy-clip', type=float, default=5.0)
     ap.add_argument('--pc-policy-smoothing', type=float, default=0.02)
+    ap.add_argument('--pc-eps-clip', type=float, default=None)
+    ap.add_argument('--pc-init', choices=['from_bp', 'xavier', 'pc'], default='from_bp')
+    ap.add_argument('--pc-optimizer', choices=['adam', 'trace', 'hebbian'], default='adam')
+    ap.add_argument('--pc-trace-scale', type=float, default=1.0)
     return ap.parse_args()
 
 
