@@ -1,0 +1,2 @@
+mode,label,seeds,mean_avg_reward,std_avg_reward,mean_final_avg50,std_final_avg50,mean_best,max_best
+pc_pc_torch_tick,PC/PC Torch tick-faithful,5,19.6492,2.8584896711375394,18.548000000000002,5.279594681412581,87.6,124

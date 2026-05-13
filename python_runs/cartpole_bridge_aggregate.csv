@@ -1,0 +1,4 @@
+run_key,run_label,seeds,mean_avg50,std_avg50,mean_avg100,mean_best
+bp_bp,BP value / BP policy,5,285.644,80.73641235526874,287.258,500.0
+pc_bp_fast,PC value / BP policy,5,301.156,73.19951693829677,301.476,500.0
+pc_pc_fast,PC value / PC policy,5,301.156,73.19951693829677,301.476,500.0

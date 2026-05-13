@@ -1,0 +1,6 @@
+seed,csv,final_eval,best_eval,best_step,first_solved_step,solved_final,solved_best
+1,python_runs/mujoco_sb3_td3_invertedpendulum_seed1_100k.csv,1000.0,1000.0,30000,30000,True,True
+7,python_runs/mujoco_sb3_td3_invertedpendulum_seed7_100k.csv,1000.0,1000.0,30000,30000,True,True
+21,python_runs/mujoco_sb3_td3_invertedpendulum_seed21_100k.csv,1000.0,1000.0,30000,30000,True,True
+42,python_runs/mujoco_sb3_td3_invertedpendulum_seed42_100k.csv,1000.0,1000.0,25000,25000,True,True
+84,python_runs/mujoco_sb3_td3_invertedpendulum_seed84_100k.csv,1000.0,1000.0,20000,20000,True,True

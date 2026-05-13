@@ -1,0 +1,4 @@
+config,label,n_seeds,mean_final_avg50,mean_final_eval,mean_best_eval,std_final_eval
+bp_q,BP actor / BP critic (TD3 Q),5,3113.1184192956666,3796.312381919065,4012.1404522153584,402.366689486455
+bp_aif,"BP actor / BP critic (AIF, G=-Q)",5,3113.1184192956666,3796.312381919065,4012.1404522153584,402.366689486455
+pcpc_aif_bpequiv,"PC actor / PC critic (AIF, BP-equivalent PC update)",5,2856.202841747729,3804.7952017226257,3804.7952017226257,341.17941798171927

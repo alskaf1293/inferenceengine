@@ -65,6 +65,16 @@ def set_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def select_device(name: str) -> torch.device:
+    if name == 'auto':
+        return torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    if name == 'cuda' and not torch.cuda.is_available():
+        raise RuntimeError('Requested --device cuda, but torch.cuda.is_available() is false')
+    return torch.device(name)
 
 
 def sample_action_from_probs(probs: torch.Tensor) -> int:
@@ -154,6 +164,10 @@ class PCValueModel:
         device: Optional[torch.device] = None,
         optimizer: str = 'adam',
         trace_scale: float = 1.0,
+        gradient_mode: str = 'pc',
+        nudge_beta: float = 0.001,
+        tick_grad_scale: float = 1.0,
+        tick_td_mode: str = 'forward',
     ):
         set_seed(seed)
         self.discount = discount
@@ -169,6 +183,18 @@ class PCValueModel:
         self.value_scale = value_scale
         self.optimizer = optimizer
         self.trace_scale = trace_scale
+        self.gradient_mode = gradient_mode
+        self.nudge_beta = nudge_beta
+        self.tick_grad_scale = tick_grad_scale
+        self.tick_td_mode = tick_td_mode
+        self.torch_fast = gradient_mode in ('pc_nudge_gated_fast', 'bp_equiv_fast')
+        self.torch_tick_exactlocal = gradient_mode == 'pc_nudge_gated_torch_exactlocal'
+        self.torch_tick = gradient_mode in (
+            'pc_nudge_gated_torch_tick',
+            'pc_nudge_gated_torch_backvec',
+            'pc_nudge_gated_torch_exactlocal',
+        )
+        self.torch_tick_backvec = gradient_mode == 'pc_nudge_gated_torch_backvec'
         self.device = device if device is not None else torch.device('cpu')
         self.net = PCNet3Layer(
             k_lut=[ACTION_SIZE, hidden, STATE_SIZE],
@@ -202,6 +228,8 @@ class PCValueModel:
             'b1': np.zeros(hidden, dtype=np.float64),
         }
         self._adam_v = {k: np.zeros_like(v) for k, v in self._adam_m.items()}
+        if self.torch_fast or self.torch_tick:
+            self._init_torch_fast_state()
 
     def _init_weights(self, init: str, seed: int, hidden: int, device: Optional[torch.device]) -> None:
         if init == 'pc':
@@ -229,6 +257,53 @@ class PCValueModel:
         self.net.layer1.bias.fill(0.0)
         self.net.layer0.W = xavier((self.net.layer0.k, self.net.layer0.n))
         self.net.layer0.bias.fill(0.0)
+
+    def _init_torch_fast_state(self) -> None:
+        dtype = torch.float32
+        self.tW0 = nn.Parameter(torch.as_tensor(self.net.layer0.W, dtype=dtype, device=self.device))
+        self.tb0 = nn.Parameter(torch.as_tensor(self.net.layer0.bias, dtype=dtype, device=self.device))
+        self.tW1 = nn.Parameter(torch.as_tensor(self.net.layer1.W, dtype=dtype, device=self.device))
+        self.tb1 = nn.Parameter(torch.as_tensor(self.net.layer1.bias, dtype=dtype, device=self.device))
+        self.topt = torch.optim.Adam([self.tW0, self.tb0, self.tW1, self.tb1], lr=self.lr)
+        self._sync_torch_target()
+
+    def _sync_torch_target(self) -> None:
+        self.t_target_W0 = self.tW0.detach().clone()
+        self.t_target_b0 = self.tb0.detach().clone()
+        self.t_target_W1 = self.tW1.detach().clone()
+        self.t_target_b1 = self.tb1.detach().clone()
+
+    def _torch_forward(self, states: torch.Tensor, target: bool = False, raw_units: bool = True) -> torch.Tensor:
+        W0, b0, W1, b1 = (
+            (self.t_target_W0, self.t_target_b0, self.t_target_W1, self.t_target_b1)
+            if target else (self.tW0, self.tb0, self.tW1, self.tb1)
+        )
+        hidden = F.relu(F.linear(states, W1, b1))
+        out_norm = F.linear(hidden, W0, b0)
+        return out_norm * self.value_scale if raw_units else out_norm
+
+    def _torch_tick_query(self, states: torch.Tensor, target: bool = False,
+                          ticks: Optional[int] = None, raw_units: bool = True) -> torch.Tensor:
+        W0, b0, W1, b1 = (
+            (self.t_target_W0, self.t_target_b0, self.t_target_W1, self.t_target_b1)
+            if target else (self.tW0, self.tb0, self.tW1, self.tb1)
+        )
+        n_ticks = self.n_query if ticks is None else ticks
+        batch = states.shape[0]
+        x1 = torch.full((batch, W1.shape[0]), 0.001, dtype=states.dtype, device=states.device)
+        x0 = torch.full((batch, W0.shape[0]), 0.001, dtype=states.dtype, device=states.device)
+        back0 = torch.zeros((batch, W1.shape[0]), dtype=states.dtype, device=states.device)
+        for _ in range(n_ticks):
+            mu1 = F.linear(states, W1, b1)
+            eps1 = x1 - mu1
+            x1 = x1 + self.gamma_pc * (back0 - eps1)
+
+            phi1 = F.relu(x1)
+            mu0 = F.linear(phi1, W0, b0)
+            eps0 = x0 - mu0
+            back0 = eps0 @ W0
+            x0 = x0 - self.gamma_pc * eps0
+        return x0 * self.value_scale if raw_units else x0
 
     def _run_ticks(self, state: np.ndarray, y_bottom: Optional[np.ndarray],
                    clamp_bottom: bool, n_ticks: int, max_ticks: int) -> None:
@@ -262,6 +337,42 @@ class PCValueModel:
             'pc_value_settle_avg_delta': self.settle_final_delta / calls,
         }
 
+    def query_drift_diagnostics(self, states: np.ndarray) -> dict[str, float]:
+        if not (self.torch_fast or self.torch_tick):
+            return {}
+        states_t = torch.as_tensor(np.asarray(states, dtype=np.float32), device=self.device)
+        if states_t.ndim == 1:
+            states_t = states_t.unsqueeze(0)
+        with torch.no_grad():
+            direct = self._torch_forward(states_t, target=False, raw_units=True)
+            tick = self._torch_tick_query(states_t, target=False, raw_units=True)
+            target_direct = self._torch_forward(states_t, target=True, raw_units=True)
+            target_tick = self._torch_tick_query(states_t, target=True, raw_units=True)
+            drift = tick - direct
+            target_drift = target_tick - target_direct
+            weight_norm = torch.sqrt(
+                (self.tW0 ** 2).sum()
+                + (self.tb0 ** 2).sum()
+                + (self.tW1 ** 2).sum()
+                + (self.tb1 ** 2).sum()
+            )
+            target_gap = torch.sqrt(
+                ((self.tW0 - self.t_target_W0) ** 2).sum()
+                + ((self.tb0 - self.t_target_b0) ** 2).sum()
+                + ((self.tW1 - self.t_target_W1) ** 2).sum()
+                + ((self.tb1 - self.t_target_b1) ** 2).sum()
+            )
+            return {
+                'pc_value_query_mse': float((drift ** 2).mean().detach().cpu().item()),
+                'pc_value_query_max_abs': float(drift.abs().max().detach().cpu().item()),
+                'pc_value_query_direct_abs_mean': float(direct.abs().mean().detach().cpu().item()),
+                'pc_value_query_tick_abs_mean': float(tick.abs().mean().detach().cpu().item()),
+                'pc_value_target_query_mse': float((target_drift ** 2).mean().detach().cpu().item()),
+                'pc_value_target_query_max_abs': float(target_drift.abs().max().detach().cpu().item()),
+                'pc_value_weight_norm': float(weight_norm.detach().cpu().item()),
+                'pc_value_target_weight_gap': float(target_gap.detach().cpu().item()),
+            }
+
     def _query_state(self, state: np.ndarray, target: bool = False) -> np.ndarray:
         l0_x = self.net.layer0.x_state.copy()
         l1_x = self.net.layer1.x_state.copy()
@@ -288,12 +399,25 @@ class PCValueModel:
         return np.asarray(out, dtype=np.float64)
 
     def predict_np(self, states: np.ndarray, target: bool = False) -> np.ndarray:
+        if self.torch_fast or self.torch_tick:
+            x = torch.as_tensor(np.asarray(states, dtype=np.float32), device=self.device)
+            if x.ndim == 1:
+                x = x.unsqueeze(0)
+            with torch.no_grad():
+                if self.torch_tick:
+                    pred = self._torch_tick_query(x, target=target, raw_units=True)
+                else:
+                    pred = self._torch_forward(x, target=target, raw_units=True)
+                return pred.detach().cpu().numpy()
         arr = np.asarray(states, dtype=np.float64)
         if arr.ndim == 1:
             return self._query_state(arr, target=target)[None, :]
         return np.stack([self._query_state(s, target=target) for s in arr], axis=0)
 
     def sync_target(self) -> None:
+        if self.torch_fast or self.torch_tick:
+            self._sync_torch_target()
+            return
         self._target_W0 = self.net.layer0.W.copy()
         self._target_b0 = self.net.layer0.bias.copy()
         self._target_W1 = self.net.layer1.W.copy()
@@ -309,6 +433,10 @@ class PCValueModel:
             self.net.tick(np.asarray(state, dtype=np.float64), target_norm, clamp_top=True, clamp_bottom=True)
 
     def _pc_gradient_single(self, state: np.ndarray, target_vec_raw: np.ndarray) -> dict[str, np.ndarray]:
+        if self.gradient_mode == 'bp_equiv':
+            return self._bp_equiv_gradient_single(state, target_vec_raw)
+        if self.gradient_mode == 'pc_nudge_gated':
+            return self._pc_nudge_gated_gradient_single(state, target_vec_raw)
         target_norm = np.asarray(target_vec_raw, dtype=np.float64) / self.value_scale
         state64 = np.asarray(state, dtype=np.float64)
         self.net.reset_state()
@@ -322,6 +450,50 @@ class PCValueModel:
             'b0': -self.net.layer0.eps.copy(),
             'W1': -np.outer(self.net.layer1.eps, input_phi),
             'b1': -self.net.layer1.eps.copy(),
+        }
+
+    def _pc_nudge_gated_gradient_single(self, state: np.ndarray, target_vec_raw: np.ndarray) -> dict[str, np.ndarray]:
+        beta = max(float(self.nudge_beta), 1e-12)
+        state64 = np.asarray(state, dtype=np.float64)
+        pred_norm = self._query_state(state64, target=False) / self.value_scale
+        target_norm = np.asarray(target_vec_raw, dtype=np.float64) / self.value_scale
+        nudged_target = pred_norm + beta * (target_norm - pred_norm)
+
+        self.net.reset_state()
+        self.net.set_rates(alpha=0.0, gamma=self.gamma_pc)
+        self._run_ticks(state64, nudged_target, True, self.n_infer, self.max_infer_ticks)
+
+        hidden_phi, hidden_prime = self.net.layer0.phi_fn(self.net.layer1.x_state)
+        input_phi, _ = self.net.layer1.phi_fn(self.net.layer2.x_state)
+        gated_hidden_eps = self.net.layer1.eps * hidden_prime
+        scale = 1.0 / beta
+        return {
+            'W0': -scale * np.outer(self.net.layer0.eps, hidden_phi),
+            'b0': -scale * self.net.layer0.eps.copy(),
+            'W1': -scale * np.outer(gated_hidden_eps, input_phi),
+            'b1': -scale * gated_hidden_eps.copy(),
+        }
+
+    def _bp_equiv_gradient_single(self, state: np.ndarray, target_vec_raw: np.ndarray) -> dict[str, np.ndarray]:
+        """Exact BP gradient for the PC value net's current two-layer MLP.
+
+        This is a diagnostic bridge, not a substrate claim: it keeps the PC
+        model/target/query path intact while isolating whether the CartPole gap
+        comes from the outer Millidge loop or from the local PC learning rule.
+        """
+        state64 = np.asarray(state, dtype=np.float64)
+        target_norm = np.asarray(target_vec_raw, dtype=np.float64) / self.value_scale
+        z1 = self.net.layer1.W @ state64 + self.net.layer1.bias
+        h = np.maximum(0.0, z1)
+        y = self.net.layer0.W @ h + self.net.layer0.bias
+        dy = (2.0 / ACTION_SIZE) * (y - target_norm)
+        dh = self.net.layer0.W.T @ dy
+        dz1 = dh * (z1 > 0.0)
+        return {
+            'W0': np.outer(dy, h),
+            'b0': dy,
+            'W1': np.outer(dz1, state64),
+            'b1': dz1,
         }
 
     def _apply_adam(self, grads: dict[str, np.ndarray]) -> None:
@@ -377,6 +549,8 @@ class PCValueModel:
                       policy_model: 'PolicyModel') -> float:
         if not memory:
             return 0.0
+        if (self.torch_fast or self.torch_tick) and self.optimizer == 'adam':
+            return self._replay_update_torch_fast(memory, policy_model)
         batch_size = min(BATCH_SIZE, len(memory))
         minibatch = random.sample(memory, batch_size)
         states = []
@@ -400,6 +574,146 @@ class PCValueModel:
         if self.optimizer == 'adam' and states:
             self._learn_batch_adam(np.stack(states), np.stack(targets_raw))
         self.last_loss = float(np.mean(losses)) if losses else 0.0
+        return self.last_loss
+
+    def _replay_update_torch_fast(self, memory: list[tuple[np.ndarray, int, float, np.ndarray, bool]],
+                                  policy_model: 'PolicyModel') -> float:
+        batch_size = min(BATCH_SIZE, len(memory))
+        minibatch = random.sample(memory, batch_size)
+        states = np.stack([item[0] for item in minibatch]).astype(np.float32)
+        next_states = np.stack([item[3] for item in minibatch]).astype(np.float32)
+        actions = np.asarray([item[1] for item in minibatch], dtype=np.int64)
+        rewards = np.asarray([item[2] for item in minibatch], dtype=np.float32)
+        dones = np.asarray([item[4] for item in minibatch], dtype=np.bool_)
+
+        states_t = torch.as_tensor(states, device=self.device)
+        next_states_t = torch.as_tensor(next_states, device=self.device)
+        actions_t = torch.as_tensor(actions, dtype=torch.long, device=self.device)
+        rewards_t = torch.as_tensor(rewards, device=self.device)
+        dones_t = torch.as_tensor(dones, dtype=torch.bool, device=self.device)
+
+        with torch.no_grad():
+            next_policy = torch.as_tensor(policy_model.probs_np(next_states), dtype=torch.float32, device=self.device)
+            next_values = (self._torch_tick_query(next_states_t, target=True, raw_units=True)
+                           if self.torch_tick and self.tick_td_mode == 'tick'
+                           else self._torch_forward(next_states_t, target=True, raw_units=True))
+            targets = rewards_t + (~dones_t).float() * self.discount * (next_policy * next_values).sum(dim=1)
+            target_vec = (self._torch_tick_query(states_t, target=False, raw_units=True)
+                          if self.torch_tick and self.tick_td_mode == 'tick'
+                          else self._torch_forward(states_t, target=False, raw_units=True)).detach()
+            target_vec[torch.arange(batch_size, device=self.device), actions_t] = targets
+
+        pred = (self._torch_tick_query(states_t, target=False, raw_units=True)
+                if self.torch_tick else self._torch_forward(states_t, target=False, raw_units=True))
+        if self.torch_tick:
+            if self.torch_tick_exactlocal:
+                return self._replay_update_torch_exactlocal(states_t, actions_t, targets, target_vec)
+            return self._replay_update_torch_tick(states_t, actions_t, targets, target_vec, pred)
+        if self.gradient_mode == 'bp_equiv_fast':
+            loss = F.mse_loss(pred, target_vec)
+        else:
+            pred_norm = pred / self.value_scale
+            target_norm = target_vec / self.value_scale
+            # Batched CUDA proxy for the small-nudge, derivative-gated PC update.
+            # It has the same local ReLU gate as pc_nudge_gated but avoids the
+            # per-sample NumPy settling loop so long sweeps can use the 4090.
+            loss = 0.5 * ((pred_norm - target_norm) ** 2).sum(dim=1).mean()
+        self.topt.zero_grad()
+        loss.backward()
+        self.topt.step()
+        with torch.no_grad():
+            per_sample_error = torch.abs(targets - pred[torch.arange(batch_size, device=self.device), actions_t])
+            self.last_loss = float(per_sample_error.mean().detach().cpu().item())
+        return self.last_loss
+
+    def _replay_update_torch_exactlocal(self, states_t: torch.Tensor, actions_t: torch.Tensor,
+                                        targets: torch.Tensor, target_vec: torch.Tensor) -> float:
+        with torch.no_grad():
+            batch = states_t.shape[0]
+            x1 = torch.full((batch, self.tW1.shape[0]), 0.001, dtype=states_t.dtype, device=self.device)
+            x0 = torch.full((batch, self.tW0.shape[0]), 0.001, dtype=states_t.dtype, device=self.device)
+            back0 = torch.zeros((batch, self.tW1.shape[0]), dtype=states_t.dtype, device=self.device)
+            for _ in range(self.n_query):
+                mu1 = F.linear(states_t, self.tW1, self.tb1)
+                eps1 = x1 - mu1
+                x1 = x1 + self.gamma_pc * (back0 - eps1)
+
+                hidden_phi = F.relu(x1)
+                mu0 = F.linear(hidden_phi, self.tW0, self.tb0)
+                eps0 = x0 - mu0
+                back0 = eps0 @ self.tW0
+                x0 = x0 - self.gamma_pc * eps0
+
+            pred = x0 * self.value_scale
+            pred_norm = pred / self.value_scale
+            target_norm = pred_norm.clone()
+            target_norm[torch.arange(batch, device=self.device), actions_t] = targets / self.value_scale
+            out_delta = pred_norm - target_norm
+            hidden_prime = (x1 > 0.0).float()
+            hidden_delta = (out_delta @ self.tW0) * hidden_prime
+
+            grad_W0 = (out_delta.T @ hidden_phi) / batch
+            grad_b0 = out_delta.mean(dim=0)
+            grad_W1 = (hidden_delta.T @ states_t) / batch
+            grad_b1 = hidden_delta.mean(dim=0)
+
+        self.topt.zero_grad()
+        self.tW0.grad = grad_W0.detach().clone()
+        self.tb0.grad = grad_b0.detach().clone()
+        self.tW1.grad = grad_W1.detach().clone()
+        self.tb1.grad = grad_b1.detach().clone()
+        self.topt.step()
+        with torch.no_grad():
+            per_sample_error = torch.abs(targets - pred[torch.arange(states_t.shape[0], device=self.device), actions_t])
+            self.last_loss = float(per_sample_error.mean().detach().cpu().item())
+        return self.last_loss
+
+    def _replay_update_torch_tick(self, states_t: torch.Tensor, actions_t: torch.Tensor,
+                                  targets: torch.Tensor, target_vec: torch.Tensor,
+                                  pred: torch.Tensor) -> float:
+        beta = max(float(self.nudge_beta), 1e-12)
+        pred_norm = pred.detach() / self.value_scale
+        target_norm = target_vec.detach() / self.value_scale
+        nudged = pred_norm + beta * (target_norm - pred_norm)
+
+        batch = states_t.shape[0]
+        x1 = torch.full((batch, self.tW1.shape[0]), 0.001, dtype=states_t.dtype, device=self.device)
+        x0 = torch.full((batch, self.tW0.shape[0]), 0.001, dtype=states_t.dtype, device=self.device)
+        back0 = torch.zeros((batch, self.tW1.shape[0]), dtype=states_t.dtype, device=self.device)
+        eps0 = torch.zeros((batch, self.tW0.shape[0]), dtype=states_t.dtype, device=self.device)
+        eps1 = torch.zeros((batch, self.tW1.shape[0]), dtype=states_t.dtype, device=self.device)
+
+        with torch.no_grad():
+            for _ in range(self.n_infer):
+                mu1 = F.linear(states_t, self.tW1, self.tb1)
+                eps1 = x1 - mu1
+                x1 = x1 + self.gamma_pc * (back0 - eps1)
+
+                phi1 = F.relu(x1)
+                mu0 = F.linear(phi1, self.tW0, self.tb0)
+                eps0 = nudged - mu0
+                back0 = eps0 @ self.tW0
+                x0 = nudged
+
+            hidden_phi = F.relu(x1)
+            hidden_prime = (x1 > 0.0).float()
+            hidden_signal = back0 if self.torch_tick_backvec else eps1
+            gated_eps1 = hidden_signal * hidden_prime
+            scale = self.tick_grad_scale / beta
+            grad_W0 = -scale * (eps0.T @ hidden_phi) / batch
+            grad_b0 = -scale * eps0.mean(dim=0)
+            grad_W1 = -scale * (gated_eps1.T @ states_t) / batch
+            grad_b1 = -scale * gated_eps1.mean(dim=0)
+
+        self.topt.zero_grad()
+        self.tW0.grad = grad_W0.detach().clone()
+        self.tb0.grad = grad_b0.detach().clone()
+        self.tW1.grad = grad_W1.detach().clone()
+        self.tb1.grad = grad_b1.detach().clone()
+        self.topt.step()
+        with torch.no_grad():
+            per_sample_error = torch.abs(targets - pred[torch.arange(states_t.shape[0], device=self.device), actions_t])
+            self.last_loss = float(per_sample_error.mean().detach().cpu().item())
         return self.last_loss
 
     def distill_from_teacher(self, memory: list[tuple[np.ndarray, int, float, np.ndarray, bool]],
@@ -493,6 +807,9 @@ class PCPolicyModel:
         device: Optional[torch.device] = None,
         optimizer: str = 'adam',
         trace_scale: float = 1.0,
+        gradient_mode: str = 'pc',
+        tick_grad_scale: float = 1.0,
+        batch_histories: bool = False,
     ):
         set_seed(seed)
         self.lr = lr
@@ -508,6 +825,12 @@ class PCPolicyModel:
         self.smoothing = smoothing
         self.optimizer = optimizer
         self.trace_scale = trace_scale
+        self.gradient_mode = gradient_mode
+        self.tick_grad_scale = tick_grad_scale
+        self.batch_histories = batch_histories
+        self.torch_fast = gradient_mode == 'fast'
+        self.torch_tick = gradient_mode in ('torch_tick', 'torch_tick_gated')
+        self.torch_tick_gated = gradient_mode == 'torch_tick_gated'
         self.device = device if device is not None else torch.device('cpu')
         self.net = PCNet3Layer(
             k_lut=[ACTION_SIZE, hidden, STATE_SIZE],
@@ -535,6 +858,8 @@ class PCPolicyModel:
             'b1': np.zeros(hidden, dtype=np.float64),
         }
         self._adam_v = {k: np.zeros_like(v) for k, v in self._adam_m.items()}
+        if self.torch_fast or self.torch_tick:
+            self._init_torch_fast_state()
 
     def _init_weights(self, init: str, seed: int, hidden: int, device: Optional[torch.device]) -> None:
         if init == 'pc':
@@ -562,6 +887,36 @@ class PCPolicyModel:
         self.net.layer1.bias.fill(0.0)
         self.net.layer0.W = xavier((self.net.layer0.k, self.net.layer0.n))
         self.net.layer0.bias.fill(0.0)
+
+    def _init_torch_fast_state(self) -> None:
+        dtype = torch.float32
+        self.tW0 = nn.Parameter(torch.as_tensor(self.net.layer0.W, dtype=dtype, device=self.device))
+        self.tb0 = nn.Parameter(torch.as_tensor(self.net.layer0.bias, dtype=dtype, device=self.device))
+        self.tW1 = nn.Parameter(torch.as_tensor(self.net.layer1.W, dtype=dtype, device=self.device))
+        self.tb1 = nn.Parameter(torch.as_tensor(self.net.layer1.bias, dtype=dtype, device=self.device))
+        self.topt = torch.optim.Adam([self.tW0, self.tb0, self.tW1, self.tb1], lr=self.lr)
+
+    def _torch_forward(self, states: torch.Tensor) -> torch.Tensor:
+        hidden = F.relu(F.linear(states, self.tW1, self.tb1))
+        return F.linear(hidden, self.tW0, self.tb0)
+
+    def _torch_tick_query(self, states: torch.Tensor, ticks: Optional[int] = None) -> torch.Tensor:
+        n_ticks = self.n_query if ticks is None else ticks
+        batch = states.shape[0]
+        x1 = torch.full((batch, self.tW1.shape[0]), 0.001, dtype=states.dtype, device=states.device)
+        x0 = torch.full((batch, self.tW0.shape[0]), 0.001, dtype=states.dtype, device=states.device)
+        back0 = torch.zeros((batch, self.tW1.shape[0]), dtype=states.dtype, device=states.device)
+        for _ in range(n_ticks):
+            mu1 = F.linear(states, self.tW1, self.tb1)
+            eps1 = x1 - mu1
+            x1 = x1 + self.gamma_pc * (back0 - eps1)
+
+            phi1 = F.relu(x1)
+            mu0 = F.linear(phi1, self.tW0, self.tb0)
+            eps0 = x0 - mu0
+            back0 = eps0 @ self.tW0
+            x0 = x0 - self.gamma_pc * eps0
+        return x0
 
     def _run_ticks(self, state: np.ndarray, y_bottom: Optional[np.ndarray],
                    clamp_bottom: bool, n_ticks: int, max_ticks: int) -> None:
@@ -609,6 +964,13 @@ class PCPolicyModel:
         return np.asarray(logits, dtype=np.float64)
 
     def logits_np(self, states: np.ndarray) -> np.ndarray:
+        if self.torch_fast or self.torch_tick:
+            x = torch.as_tensor(np.asarray(states, dtype=np.float32), device=self.device)
+            if x.ndim == 1:
+                x = x.unsqueeze(0)
+            with torch.no_grad():
+                pred = self._torch_tick_query(x) if self.torch_tick else self._torch_forward(x)
+                return pred.detach().cpu().numpy()
         arr = np.asarray(states, dtype=np.float64)
         if arr.ndim == 1:
             return self._query_state(arr)[None, :]
@@ -621,6 +983,14 @@ class PCPolicyModel:
         return np.stack([softmax_np(row) for row in logits], axis=0)
 
     def sample_action(self, state: np.ndarray) -> int:
+        if self.torch_fast:
+            x = torch.as_tensor(np.asarray(state, dtype=np.float32), device=self.device).unsqueeze(0)
+            probs_t = F.softmax(self._torch_forward(x), dim=1).squeeze(0)
+            return sample_action_from_probs(probs_t)
+        if self.torch_tick:
+            x = torch.as_tensor(np.asarray(state, dtype=np.float32), device=self.device).unsqueeze(0)
+            probs_t = F.softmax(self._torch_tick_query(x), dim=1).squeeze(0)
+            return sample_action_from_probs(probs_t)
         probs = self.probs_np(np.asarray(state, dtype=np.float64))[0]
         probs_t = torch.as_tensor(probs, dtype=torch.float32, device=self.device)
         return sample_action_from_probs(probs_t)
@@ -745,6 +1115,10 @@ class PCPolicyModel:
         return float(np.mean(losses)) if losses else 0.0
 
     def update_histories(self, histories: list[History], value_model: object) -> float:
+        if self.torch_fast:
+            return self._update_histories_torch_fast(histories, value_model)
+        if self.torch_tick:
+            return self._update_histories_torch_tick(histories, value_model)
         if self.optimizer == 'adam':
             self.last_loss = self._update_histories_adam(histories, value_model)
             return self.last_loss
@@ -762,6 +1136,139 @@ class PCPolicyModel:
         self.last_loss = float(np.mean(losses)) if losses else 0.0
         return self.last_loss
 
+    def _update_histories_torch_fast(self, histories: list[History], value_model: object) -> float:
+        losses = []
+        for hist in histories:
+            if not hist.states:
+                continue
+            states = np.asarray(hist.states, dtype=np.float32)
+            states_t = torch.as_tensor(states, device=self.device)
+            logits = self._torch_forward(states_t)
+            p = F.softmax(logits, dim=1)
+            with torch.no_grad():
+                values = torch.as_tensor(value_model.predict_np(states), dtype=torch.float32, device=self.device)
+            losses.append(-(p * F.log_softmax(values, dim=1)).sum(dim=1).mean())
+        if not losses:
+            self.last_loss = 0.0
+            return 0.0
+        loss = torch.stack(losses).mean()
+        self.topt.zero_grad()
+        loss.backward()
+        self.topt.step()
+        self.last_loss = float(loss.detach().cpu().item())
+        return self.last_loss
+
+    def _update_histories_torch_tick(self, histories: list[History], value_model: object) -> float:
+        if self.batch_histories:
+            return self._update_histories_torch_tick_batched(histories, value_model)
+        losses = []
+        for hist in histories:
+            if not hist.states:
+                continue
+            states = np.asarray(hist.states, dtype=np.float32)
+            states_t = torch.as_tensor(states, device=self.device)
+            logits = self._torch_tick_query(states_t)
+            probs = F.softmax(logits, dim=1)
+            with torch.no_grad():
+                values = torch.as_tensor(value_model.predict_np(states), dtype=torch.float32, device=self.device)
+                value_log_probs = F.log_softmax(values, dim=1)
+                expected = (probs * value_log_probs).sum(dim=1, keepdim=True)
+                grad_logits = probs * (expected - value_log_probs)
+                target = logits.detach() - grad_logits
+
+            batch = states_t.shape[0]
+            x1 = torch.full((batch, self.tW1.shape[0]), 0.001, dtype=states_t.dtype, device=self.device)
+            x0 = torch.full((batch, self.tW0.shape[0]), 0.001, dtype=states_t.dtype, device=self.device)
+            back0 = torch.zeros((batch, self.tW1.shape[0]), dtype=states_t.dtype, device=self.device)
+            eps0 = torch.zeros((batch, self.tW0.shape[0]), dtype=states_t.dtype, device=self.device)
+            eps1 = torch.zeros((batch, self.tW1.shape[0]), dtype=states_t.dtype, device=self.device)
+            with torch.no_grad():
+                for _ in range(self.n_infer):
+                    mu1 = F.linear(states_t, self.tW1, self.tb1)
+                    eps1 = x1 - mu1
+                    x1 = x1 + self.gamma_pc * (back0 - eps1)
+
+                    phi1 = F.relu(x1)
+                    mu0 = F.linear(phi1, self.tW0, self.tb0)
+                    eps0 = target - mu0
+                    back0 = eps0 @ self.tW0
+                    x0 = target
+
+                hidden_phi = F.relu(x1)
+                scale = self.tick_grad_scale
+                grad_W0 = -scale * (eps0.T @ hidden_phi) / batch
+                grad_b0 = -scale * eps0.mean(dim=0)
+                hidden_eps = eps1 * (x1 > 0.0).float() if self.torch_tick_gated else eps1
+                grad_W1 = -scale * (hidden_eps.T @ states_t) / batch
+                grad_b1 = -scale * hidden_eps.mean(dim=0)
+
+            self.topt.zero_grad()
+            self.tW0.grad = grad_W0.detach().clone()
+            self.tb0.grad = grad_b0.detach().clone()
+            self.tW1.grad = grad_W1.detach().clone()
+            self.tb1.grad = grad_b1.detach().clone()
+            self.topt.step()
+            losses.append(-expected.mean())
+        if not losses:
+            self.last_loss = 0.0
+            return 0.0
+        self.last_loss = float(torch.stack(losses).mean().detach().cpu().item())
+        return self.last_loss
+
+    def _update_histories_torch_tick_batched(self, histories: list[History], value_model: object) -> float:
+        states_parts = [
+            np.asarray(hist.states, dtype=np.float32)
+            for hist in histories
+            if hist.states
+        ]
+        if not states_parts:
+            self.last_loss = 0.0
+            return 0.0
+
+        states = np.concatenate(states_parts, axis=0)
+        states_t = torch.as_tensor(states, device=self.device)
+        logits = self._torch_tick_query(states_t)
+        probs = F.softmax(logits, dim=1)
+        with torch.no_grad():
+            values = torch.as_tensor(value_model.predict_np(states), dtype=torch.float32, device=self.device)
+            value_log_probs = F.log_softmax(values, dim=1)
+            expected = (probs * value_log_probs).sum(dim=1, keepdim=True)
+            grad_logits = probs * (expected - value_log_probs)
+            target = logits.detach() - grad_logits
+
+        batch = states_t.shape[0]
+        x1 = torch.full((batch, self.tW1.shape[0]), 0.001, dtype=states_t.dtype, device=self.device)
+        back0 = torch.zeros((batch, self.tW1.shape[0]), dtype=states_t.dtype, device=self.device)
+        eps0 = torch.zeros((batch, self.tW0.shape[0]), dtype=states_t.dtype, device=self.device)
+        eps1 = torch.zeros((batch, self.tW1.shape[0]), dtype=states_t.dtype, device=self.device)
+        with torch.no_grad():
+            for _ in range(self.n_infer):
+                mu1 = F.linear(states_t, self.tW1, self.tb1)
+                eps1 = x1 - mu1
+                x1 = x1 + self.gamma_pc * (back0 - eps1)
+
+                phi1 = F.relu(x1)
+                mu0 = F.linear(phi1, self.tW0, self.tb0)
+                eps0 = target - mu0
+                back0 = eps0 @ self.tW0
+
+            hidden_phi = F.relu(x1)
+            scale = self.tick_grad_scale
+            grad_W0 = -scale * (eps0.T @ hidden_phi) / batch
+            grad_b0 = -scale * eps0.mean(dim=0)
+            hidden_eps = eps1 * (x1 > 0.0).float() if self.torch_tick_gated else eps1
+            grad_W1 = -scale * (hidden_eps.T @ states_t) / batch
+            grad_b1 = -scale * hidden_eps.mean(dim=0)
+
+        self.topt.zero_grad()
+        self.tW0.grad = grad_W0.detach().clone()
+        self.tb0.grad = grad_b0.detach().clone()
+        self.tW1.grad = grad_W1.detach().clone()
+        self.tb1.grad = grad_b1.detach().clone()
+        self.topt.step()
+        self.last_loss = float((-expected.mean()).detach().cpu().item())
+        return self.last_loss
+
 
 def make_models(args: argparse.Namespace, device: torch.device):
     if args.value_backend == 'bp':
@@ -775,7 +1282,7 @@ def make_models(args: argparse.Namespace, device: torch.device):
             gamma_pc=args.gamma_pc,
             n_infer=args.pc_infer,
             n_learn=args.pc_learn,
-            n_query=args.pc_query,
+            n_query=args.pc_value_query if args.pc_value_query is not None else args.pc_query,
             adaptive_inference=not args.no_adaptive_inference,
             settle_tol=args.settle_tol,
             max_infer_ticks=args.max_infer_ticks,
@@ -788,6 +1295,10 @@ def make_models(args: argparse.Namespace, device: torch.device):
             device=device,
             optimizer=args.pc_optimizer,
             trace_scale=args.pc_trace_scale,
+            gradient_mode=args.pc_gradient_mode,
+            nudge_beta=args.pc_nudge_beta,
+            tick_grad_scale=args.pc_value_tick_grad_scale,
+            tick_td_mode=args.pc_tick_td_mode,
         )
     if args.policy_backend == 'bp':
         policy_model = BPPolicyModel(args.hidden, args.lr_policy, args.seed + 1, device)
@@ -799,7 +1310,7 @@ def make_models(args: argparse.Namespace, device: torch.device):
             gamma_pc=args.gamma_pc,
             n_infer=args.pc_infer,
             n_learn=args.pc_learn,
-            n_query=args.pc_query,
+            n_query=args.pc_policy_query if args.pc_policy_query is not None else args.pc_query,
             adaptive_inference=not args.no_adaptive_inference,
             settle_tol=args.settle_tol,
             max_infer_ticks=args.max_infer_ticks,
@@ -812,13 +1323,18 @@ def make_models(args: argparse.Namespace, device: torch.device):
             device=device,
             optimizer=args.pc_optimizer,
             trace_scale=args.pc_trace_scale,
+            gradient_mode=args.pc_policy_gradient_mode,
+            tick_grad_scale=args.pc_policy_tick_grad_scale,
+            batch_histories=args.pc_policy_batch_histories,
         )
     return value_model, policy_model
 
 
 def main(args: argparse.Namespace) -> tuple[list[int], list[float], list[float]]:
     set_seed(args.seed)
-    device = torch.device('cpu')
+    device = select_device(args.device)
+    if args.print_device:
+        print(f'using device: {device}')
     env = gym.make('CartPole-v1')
     env.reset(seed=args.seed)
     value_model, policy_model = make_models(args, device)
@@ -841,7 +1357,11 @@ def main(args: argparse.Namespace) -> tuple[list[int], list[float], list[float]]
                          'pc_value_settle_avg_ticks', 'pc_value_settle_cap_rate',
                          'pc_value_settle_avg_delta',
                          'pc_policy_settle_avg_ticks', 'pc_policy_settle_cap_rate',
-                         'pc_policy_settle_avg_delta'])
+                         'pc_policy_settle_avg_delta',
+                         'pc_value_query_mse', 'pc_value_query_max_abs',
+                         'pc_value_query_direct_abs_mean', 'pc_value_query_tick_abs_mean',
+                         'pc_value_target_query_mse', 'pc_value_target_query_max_abs',
+                         'pc_value_weight_norm', 'pc_value_target_weight_gap'])
 
         for episode in range(1, args.episodes + 1):
             obs, _ = env.reset()
@@ -871,7 +1391,7 @@ def main(args: argparse.Namespace) -> tuple[list[int], list[float], list[float]]
             avgreward = 0.1 * episode_reward + 0.9 * avgreward
 
             if episode % args.infotime == 0:
-                print(f'(episode:{episode}, avgreward:{avgreward})')
+                print(f'(episode:{episode}, avgreward:{avgreward})', flush=True)
 
             if episode % args.policy_train_every == 0:
                 ploss = policy_model.update_histories(histories, value_model)
@@ -897,6 +1417,15 @@ def main(args: argparse.Namespace) -> tuple[list[int], list[float], list[float]]
             plosses.append(float(ploss))
             vlosses.append(float(vloss))
             diag = value_model.diagnostics() if hasattr(value_model, 'diagnostics') else {}
+            if (
+                args.critic_drift_every > 0
+                and episode % args.critic_drift_every == 0
+                and hasattr(value_model, 'query_drift_diagnostics')
+                and memory
+            ):
+                drift_batch = random.sample(memory, min(args.critic_drift_batch, len(memory)))
+                drift_states = np.stack([item[0] for item in drift_batch]).astype(np.float32)
+                diag.update(value_model.query_drift_diagnostics(drift_states))
             if hasattr(policy_model, 'diagnostics'):
                 diag.update(policy_model.diagnostics())
             writer.writerow([episode, episode_reward, avgreward, plosses[-1], vlosses[-1],
@@ -906,7 +1435,15 @@ def main(args: argparse.Namespace) -> tuple[list[int], list[float], list[float]]
                              diag.get('pc_value_settle_avg_delta', ''),
                              diag.get('pc_policy_settle_avg_ticks', ''),
                              diag.get('pc_policy_settle_cap_rate', ''),
-                             diag.get('pc_policy_settle_avg_delta', '')])
+                             diag.get('pc_policy_settle_avg_delta', ''),
+                             diag.get('pc_value_query_mse', ''),
+                             diag.get('pc_value_query_max_abs', ''),
+                             diag.get('pc_value_query_direct_abs_mean', ''),
+                             diag.get('pc_value_query_tick_abs_mean', ''),
+                             diag.get('pc_value_target_query_mse', ''),
+                             diag.get('pc_value_target_query_max_abs', ''),
+                             diag.get('pc_value_weight_norm', ''),
+                             diag.get('pc_value_target_weight_gap', '')])
 
     env.close()
     return rewards, plosses, vlosses
@@ -936,6 +1473,8 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument('--max-infer-ticks', type=int, default=200)
     ap.add_argument('--max-query-ticks', type=int, default=300)
     ap.add_argument('--no-adaptive-inference', action='store_true')
+    ap.add_argument('--pc-value-query', type=int, default=None)
+    ap.add_argument('--pc-policy-query', type=int, default=None)
     ap.add_argument('--pc-value-scale', type=float, default=1.0)
     ap.add_argument('--pc-value-clip', type=float, default=None)
     ap.add_argument('--pc-hidden-clip', type=float, default=None)
@@ -945,6 +1484,22 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument('--pc-init', choices=['from_bp', 'xavier', 'pc'], default='from_bp')
     ap.add_argument('--pc-optimizer', choices=['adam', 'trace', 'hebbian'], default='adam')
     ap.add_argument('--pc-trace-scale', type=float, default=1.0)
+    ap.add_argument('--pc-gradient-mode',
+                    choices=['pc', 'pc_nudge_gated', 'pc_nudge_gated_fast',
+                             'pc_nudge_gated_torch_tick', 'pc_nudge_gated_torch_backvec',
+                             'pc_nudge_gated_torch_exactlocal',
+                             'bp_equiv', 'bp_equiv_fast'],
+                    default='pc')
+    ap.add_argument('--pc-nudge-beta', type=float, default=0.001)
+    ap.add_argument('--pc-policy-gradient-mode', choices=['pc', 'fast', 'torch_tick', 'torch_tick_gated'], default='pc')
+    ap.add_argument('--pc-policy-batch-histories', action='store_true')
+    ap.add_argument('--pc-value-tick-grad-scale', type=float, default=1.0)
+    ap.add_argument('--pc-policy-tick-grad-scale', type=float, default=1.0)
+    ap.add_argument('--pc-tick-td-mode', choices=['forward', 'tick'], default='forward')
+    ap.add_argument('--critic-drift-every', type=int, default=0)
+    ap.add_argument('--critic-drift-batch', type=int, default=128)
+    ap.add_argument('--device', choices=['auto', 'cpu', 'cuda'], default='auto')
+    ap.add_argument('--print-device', action='store_true')
     return ap.parse_args()
 
 

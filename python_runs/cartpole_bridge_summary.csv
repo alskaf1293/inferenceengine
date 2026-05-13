@@ -1,0 +1,16 @@
+run_key,run_label,seed,episodes,final_avg50,final_avg100,best,first_ep_avg100_ge_195,csv
+bp_bp,BP value / BP policy,1,2000,406.78,436.6,500,1673,python_runs/sweep_bp_bp_seed1_2000.csv
+bp_bp,BP value / BP policy,7,2000,279.04,273.14,500,1508,python_runs/sweep_bp_bp_seed7_2000.csv
+bp_bp,BP value / BP policy,21,2000,230.08,204.94,500,1556,python_runs/sweep_bp_bp_seed21_2000.csv
+bp_bp,BP value / BP policy,42,2000,313.3,305.29,500,1623,python_runs/sweep_bp_bp_seed42_2000.csv
+bp_bp,BP value / BP policy,84,2000,199.02,216.32,500,1542,python_runs/sweep_bp_bp_seed84_2000.csv
+pc_bp_fast,PC value / BP policy,1,2000,406.78,436.6,500,1673,python_runs/sweep_pc_bp_nudgefast_seed1_2000.csv
+pc_bp_fast,PC value / BP policy,7,2000,279.04,273.14,500,1508,python_runs/sweep_pc_bp_nudgefast_seed7_2000.csv
+pc_bp_fast,PC value / BP policy,21,2000,230.08,204.94,500,1556,python_runs/sweep_pc_bp_nudgefast_seed21_2000.csv
+pc_bp_fast,PC value / BP policy,42,2000,343.2,332.65,500,1621,python_runs/sweep_pc_bp_nudgefast_seed42_2000.csv
+pc_bp_fast,PC value / BP policy,84,2000,246.68,260.05,500,1525,python_runs/sweep_pc_bp_nudgefast_seed84_2000.csv
+pc_pc_fast,PC value / PC policy,1,2000,406.78,436.6,500,1673,python_runs/sweep_pc_pc_fast_seed1_2000.csv
+pc_pc_fast,PC value / PC policy,7,2000,279.04,273.14,500,1508,python_runs/sweep_pc_pc_fast_seed7_2000.csv
+pc_pc_fast,PC value / PC policy,21,2000,230.08,204.94,500,1556,python_runs/sweep_pc_pc_fast_seed21_2000.csv
+pc_pc_fast,PC value / PC policy,42,2000,343.2,332.65,500,1621,python_runs/sweep_pc_pc_fast_seed42_2000.csv
+pc_pc_fast,PC value / PC policy,84,2000,246.68,260.05,500,1525,python_runs/sweep_pc_pc_fast_seed84_2000.csv

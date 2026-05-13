@@ -1,0 +1,6 @@
+mode,label,seed,episodes,avg_reward,final_avg50,best,csv
+pc_pc_torch_tick,PC/PC Torch tick-faithful,1,500,19.858,17.04,124,/home/gregoryv/Documents/inferenceengine/python_runs/align_pc_pc_torchtick_seed1_500.csv
+pc_pc_torch_tick,PC/PC Torch tick-faithful,7,500,22.81,14.26,102,/home/gregoryv/Documents/inferenceengine/python_runs/align_pc_pc_torchtick_seed7_500.csv
+pc_pc_torch_tick,PC/PC Torch tick-faithful,21,500,16.15,14.2,54,/home/gregoryv/Documents/inferenceengine/python_runs/align_pc_pc_torchtick_seed21_500.csv
+pc_pc_torch_tick,PC/PC Torch tick-faithful,42,500,21.994,26.82,94,/home/gregoryv/Documents/inferenceengine/python_runs/align_pc_pc_torchtick_seed42_500.csv
+pc_pc_torch_tick,PC/PC Torch tick-faithful,84,500,17.434,20.42,64,/home/gregoryv/Documents/inferenceengine/python_runs/align_pc_pc_torchtick_seed84_500.csv
