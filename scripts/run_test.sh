@@ -9,6 +9,9 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 "$ROOT/scripts/check_env.sh"
 cd "$ROOT"
 
+MDIR="${VERILATOR_MDIR:-obj_dir}"
+BIN="$ROOT/$MDIR/V${TOP}"
+
 VERILATOR_EXTRA=()
 SIM_EXTRA=()
 SEEN_SEP=0
@@ -31,9 +34,30 @@ COMMON_FLAGS=(
   -Wno-fatal
   -Wno-TIMESCALEMOD -Wno-WIDTHTRUNC -Wno-WIDTHEXPAND -Wno-DECLFILENAME
   -Wno-GENUNNAMED -Wno-VARHIDDEN -Wno-PROCASSINIT -Wno-UNUSEDSIGNAL
-  -Wno-UNOPTFLAT -Wno-UNSIGNED -Wno-UNDRIVEN -Wno-LATCH
+  -Wno-UNOPTFLAT -Wno-UNSIGNED -Wno-UNDRIVEN -Wno-LATCH -Wno-WIDTHCONCAT
   -I"$ROOT/HardFloat/source" -I"$ROOT/HardFloat/source/8086-SSE"
+  --Mdir "$ROOT/$MDIR"
 )
+
+if [[ -n "${VERILATOR_BUILD_JOBS:-}" ]]; then
+  COMMON_FLAGS+=(--build-jobs "$VERILATOR_BUILD_JOBS")
+fi
+
+if [[ -n "${VERILATOR_VERILATE_JOBS:-}" ]]; then
+  COMMON_FLAGS+=(--verilate-jobs "$VERILATOR_VERILATE_JOBS")
+fi
+
+if [[ -n "${VERILATOR_THREADS:-}" ]]; then
+  COMMON_FLAGS+=(--threads "$VERILATOR_THREADS")
+fi
+
+if [[ -n "${VERILATOR_OUTPUT_SPLIT:-}" ]]; then
+  COMMON_FLAGS+=(--output-split "$VERILATOR_OUTPUT_SPLIT")
+fi
+
+if [[ -n "${VERILATOR_OUTPUT_SPLIT_CFUNCS:-}" ]]; then
+  COMMON_FLAGS+=(--output-split-cfuncs "$VERILATOR_OUTPUT_SPLIT_CFUNCS")
+fi
 
 COMMON_SRCS=(
   "$ROOT/HardFloat/source/HardFloat_primitives.v"
@@ -60,11 +84,13 @@ COMMON_SRCS=(
 
 DPI="$ROOT/tb/dpi_casts.cc"
 
-verilator "${COMMON_FLAGS[@]}" \
-  "${VERILATOR_EXTRA[@]}" \
-  "${COMMON_SRCS[@]}" \
-  "$ROOT/$TB" \
-  --top-module "$TOP" \
-  --exe "$DPI"
+if [[ "${VERILATOR_REUSE_BINARY:-0}" != "1" || ! -x "$BIN" ]]; then
+  verilator "${COMMON_FLAGS[@]}" \
+    "${VERILATOR_EXTRA[@]}" \
+    "${COMMON_SRCS[@]}" \
+    "$ROOT/$TB" \
+    --top-module "$TOP" \
+    --exe "$DPI"
+fi
 
-"$ROOT/obj_dir/V${TOP}" "${SIM_EXTRA[@]}"
+"$BIN" "${SIM_EXTRA[@]}"

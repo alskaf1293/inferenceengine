@@ -1,0 +1,5 @@
+case,epochs,infer_ticks,learn_ticks,eval_ticks,alpha,gamma,max_abs_error,final_mse,status,csv
+base_e3_i10_l2_v20_a005_g010,3,10,2,20,0.05,0.1,4.75322975e-10,0.040416668,pass,runs/rtl_supervised_fixed_sweep/base_e3_i10_l2_v20_a005_g010.csv
+short_e3_i5_l1_v10_a002_g005,3,5,1,10,0.02,0.05,1.16381301e-09,0.058083781,pass,runs/rtl_supervised_fixed_sweep/short_e3_i5_l1_v10_a002_g005.csv
+strong_e3_i10_l2_v20_a010_g020,3,10,2,20,0.1,0.2,4.33792217e-10,0.037921148,pass,runs/rtl_supervised_fixed_sweep/strong_e3_i10_l2_v20_a010_g020.csv
+longer_e5_i15_l3_v25_a005_g010,5,15,3,25,0.05,0.1,6.53811304e-10,0.039032147,pass,runs/rtl_supervised_fixed_sweep/longer_e5_i15_l3_v25_a005_g010.csv

@@ -1,0 +1,26 @@
+read_verilog -sv \
+  -IHardFloat/source \
+  -IHardFloat/source/8086-SSE \
+  HardFloat/source/HardFloat_primitives.v \
+  HardFloat/source/HardFloat_consts.vi \
+  HardFloat/source/HardFloat_localFuncs.vi \
+  HardFloat/source/HardFloat_rawFN.v \
+  HardFloat/source/addRecFN.v \
+  HardFloat/source/compareRecFN.v \
+  HardFloat/source/divSqrtRecFN_small.v \
+  HardFloat/source/fNToRecFN.v \
+  HardFloat/source/iNToRecFN.v \
+  HardFloat/source/isSigNaNRecFN.v \
+  HardFloat/source/mulAddRecFN.v \
+  HardFloat/source/mulRecFN.v \
+  HardFloat/source/recFNToFN.v \
+  HardFloat/source/recFNToIN.v \
+  HardFloat/source/recFNToRecFN.v \
+  HardFloat/source/8086-SSE/HardFloat_specialize.v \
+  rtl/hf_mac32.sv \
+  rtl/activation_relu32.sv \
+  rtl/nc_neuralcomputer.sv \
+  rtl/synth_pcnet_256_top.sv
+
+hierarchy -check -top synth_pcnet_256_top
+stat -top synth_pcnet_256_top

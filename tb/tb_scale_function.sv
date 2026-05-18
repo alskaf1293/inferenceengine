@@ -303,7 +303,7 @@ module tb_scale_function #(
 
   // --------------------------------------------------------------------
   // Build dataset using uniform random sampling over the K2 top dims
-  // Call $srandom(RAND_SEED) before invoking this task.
+  // Seed $urandom before invoking this task.
   // --------------------------------------------------------------------
   task automatic build_dataset();
     real h[K1];
@@ -524,7 +524,7 @@ module tb_scale_function #(
     clear_clamps();
 
     load_runtime_config();
-    $srandom(RAND_SEED);
+    void'($urandom(RAND_SEED));
     build_dataset();
 
     wait(rst_n);

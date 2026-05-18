@@ -798,6 +798,364 @@ Important environment note: the Codex sandbox still hides `/dev/nvidia*`, so GPU
 
 CartPole, Pendulum, and MuJoCo now all have CUDA-capable PC experiment paths. Some legacy NumPy tick-faithful comparison modes are still CPU-bound, but the current Torch/exact-local runs use the GPU when launched with `--device cuda`.
 
+## RTL-Faithful Verification Start
+
+Current scientific bottleneck: move from functional PC/PC BP-equivalent AIF replication to RTL-faithful physical inference-engine verification.
+
+First checks completed:
+
+- Read `mypaper.pdf` and compared its local PC equations against `rtl/nc_neuralcomputer.sv`.
+- The RTL neuron FSM implements the paper dynamics:
+  - `PRED`: `mu_i = sum_j theta_ij * phi(x_j_up) + bias`
+  - `ERR`: `eps_i = x_eff - mu_i`
+  - `BACKSUM/BACKVEC`: `back_eff = phi'(x_eff) * sum(back_in)`, `back_vec[j] = theta_j * eps_i`
+  - `WUP`: `theta_j += alpha * eps_i * phi(x_j_up)`
+  - `STATE`: `x_i += gamma * (back_eff - eps_i)` unless hard-clamped
+- Added primitive RTL trace testbench: `tb/tb_neuron_tick_trace.sv`
+- Added Python oracle checker: `scripts/check_neuron_tick_trace.py`
+- Added primitive sweep runner: `scripts/exp_rtl_primitive_sweep.py`
+- Verification result:
+  - command: `./scripts/run_test.sh tb/tb_neuron_tick_trace.sv tb_neuron_tick_trace -- +CSV=runs/neuron_tick_trace.csv`
+  - command: `/home/gregoryv/miniconda3/envs/dsl2/bin/python scripts/check_neuron_tick_trace.py --csv runs/neuron_tick_trace.csv`
+  - result: `PASS neuron tick RTL matches Python oracle`
+  - max absolute error: `4.91172797e-10`
+- Primitive sweep result:
+  - command: `/home/gregoryv/miniconda3/envs/dsl2/bin/python scripts/exp_rtl_primitive_sweep.py`
+  - summary: `runs/rtl_primitive_sweep_summary.csv`
+  - cases passed:
+    - `linear_free`: max abs `4.91172797e-10`
+    - `linear_soft_xset`: max abs `2.94209747e-08`
+    - `linear_hard_xset`: max abs `2.94209747e-08`
+    - `relu_free`: max abs `4.9011612e-10`
+    - `relu_soft_xset`: max abs `4.70348357e-10`
+    - `relu_hard_xset`: max abs `4.70348357e-10`
+- Added `PCNet3Layer.tick_parallel()` in `python_rtl/pc_network.py` to snapshot inter-layer state/backflow before layer commits. This matches RTL `pc_network_nlayer` simultaneous `start_tick` semantics better than the old sequential/Gauss-Seidel Python helper.
+- Added new general Python reference class `PCNetNLayer` in `python_rtl/pc_network.py`.
+  - It is separate from `PCNet3Layer`; existing 3-layer dynamics are preserved.
+  - It supports arbitrary bottom-to-top `k_lut` / `act_lut` stacks.
+  - `tick_parallel()` uses simultaneous RTL-boundary timing for all layers.
+  - It defaults to RTL-like top-layer presynaptic width (`top_rtl_width=True`) for network trace work; `top_rtl_width=False` can be used to match legacy `PCNet3Layer` behavior exactly.
+  - Important trace detail: clamped layers expose their observed/effective state at the RTL boundary, so `PCNetNLayer.tick_parallel()` uses `x_eff = obs` for clamped upstream layers when building the next layer's `x_up`.
+- Added `scripts/check_pcnet_nlayer.py`.
+  - It verifies `PCNetNLayer(..., top_rtl_width=False)` matches `PCNet3Layer.tick_parallel()` exactly on a 3-layer smoke.
+  - It also runs a 4-layer smoke to confirm the generalized class functions beyond three layers.
+  - Result: `PASS PCNetNLayer checks`
+- Added deterministic RTL network trace:
+  - testbench: `tb/tb_network_tick_trace.sv`
+  - checker: `scripts/check_network_tick_trace.py`
+  - output: `runs/network_tick_trace.csv`
+  - command: `./scripts/run_test.sh tb/tb_network_tick_trace.sv tb_network_tick_trace -- +CSV=runs/network_tick_trace.csv`
+  - command: `/home/gregoryv/miniconda3/envs/dsl2/bin/python scripts/check_network_tick_trace.py --csv runs/network_tick_trace.csv`
+  - result: `PASS network tick RTL matches PCNetNLayer`
+  - max absolute error: `2.4e-08`
+  - trace compares layer states plus representative weights/biases/back-vector fields across 4 deterministic ticks.
+- Parameterized `tb/tb_network_tick_trace.sv` over activation IDs and runtime `+ALPHA` / `+GAMMA`.
+- Added network trace sweep:
+  - script: `scripts/exp_rtl_network_trace_sweep.py`
+  - summary: `runs/rtl_network_trace_sweep_summary.csv`
+  - command: `/home/gregoryv/miniconda3/envs/dsl2/bin/python scripts/exp_rtl_network_trace_sweep.py`
+  - cases passed:
+    - `linear/relu/linear`, alpha `0.05`, gamma `0.10`
+    - `linear/relu/linear`, alpha `0.02`, gamma `0.05`
+    - `linear/relu/linear`, alpha `0.10`, gamma `0.20`
+    - `linear/linear/linear`, alpha `0.05`, gamma `0.10`
+    - `relu/relu/linear`, alpha `0.05`, gamma `0.10`
+  - all cases max absolute error: `2.4e-08`
+  - Note: tanh/sigmoid RTL blocks are approximate hardware activation paths, so they should get an approximation-aware oracle before being included in exact trace sweeps.
+- Added `--schedule {sequential,parallel}` and `--learn-gamma-mode {frozen,rtl}` to `python_rtl/tb_scale_function.py`.
+  - Important mismatch found: the RTL scale testbench keeps `gamma` active during learning ticks, while the historical Python scale path froze state updates with `gamma=0` during learn ticks.
+- Patched `tb/tb_scale_function.sv` to seed via Verilator-supported `$urandom(RAND_SEED)` instead of unsupported `$srandom`.
+- RTL supervised smoke now runs:
+  - command: `./scripts/run_test.sh tb/tb_scale_function.sv tb_scale_function -- +CSV=runs/scale_2_4_3_rtl_smoke.csv +N_SAMPLES=8 +SEED=0 +EPOCHS=2 +INFER_TICKS=20 +LEARN_TICKS=3 +EVAL_TICKS=40 +ALPHA=0.05 +GAMMA=0.10`
+  - MSE: `0.139199 -> 0.109118 -> 0.103912`
+- Python supervised smoke with RTL-aligned schedule also runs:
+  - command: `/home/gregoryv/miniconda3/envs/dsl2/bin/python python_rtl/tb_scale_function.py --configs 2_4_3 --teacher tiled --act-hidden relu --alpha 0.05 --gamma 0.10 --infer-ticks 20 --learn-ticks 3 --eval-settle 40 --epochs 2 --n-samples 8 --seed 0 --schedule parallel --learn-gamma-mode rtl`
+  - MSE: `0.828441 -> 0.078810 -> 0.075311`
+- Added deterministic supervised RTL-vs-Python learning trace:
+  - testbench: `tb/tb_supervised_fixed_trace.sv`
+  - checker: `scripts/check_supervised_fixed_trace.py`
+  - output: `runs/supervised_fixed_trace.csv`
+  - command: `./scripts/run_test.sh tb/tb_supervised_fixed_trace.sv tb_supervised_fixed_trace -- +CSV=runs/supervised_fixed_trace.csv`
+  - command: `/home/gregoryv/miniconda3/envs/dsl2/bin/python scripts/check_supervised_fixed_trace.py --csv runs/supervised_fixed_trace.csv`
+  - result: `PASS supervised fixed RTL learning curve matches PCNetNLayer`
+  - max absolute MSE error: `4.75322975e-10`
+  - RTL MSE curve: `0.038752304 -> 0.040932202 -> 0.040604896 -> 0.040416668`
+  - This uses a fixed 4-sample dataset, no RNG, 2->4->3 linear/ReLU/linear network, RTL-style parallel tick schedule, gamma active during learning.
+- Parameterized `tb/tb_supervised_fixed_trace.sv` and `scripts/check_supervised_fixed_trace.py` over epochs, infer ticks, learn ticks, eval ticks, alpha, and gamma.
+- Added supervised fixed-dataset sweep:
+  - script: `scripts/exp_rtl_supervised_fixed_sweep.py`
+  - summary: `runs/rtl_supervised_fixed_sweep_summary.csv`
+  - command: `/home/gregoryv/miniconda3/envs/dsl2/bin/python scripts/exp_rtl_supervised_fixed_sweep.py`
+  - cases passed:
+    - base: epochs `3`, infer `10`, learn `2`, eval `20`, alpha `0.05`, gamma `0.10`, max abs `4.75322975e-10`, final MSE `0.040416668`
+    - short: epochs `3`, infer `5`, learn `1`, eval `10`, alpha `0.02`, gamma `0.05`, max abs `1.16381301e-09`, final MSE `0.058083781`
+    - strong: epochs `3`, infer `10`, learn `2`, eval `20`, alpha `0.10`, gamma `0.20`, max abs `4.33792217e-10`, final MSE `0.037921148`
+    - longer: epochs `5`, infer `15`, learn `3`, eval `25`, alpha `0.05`, gamma `0.10`, max abs `6.53811304e-10`, final MSE `0.039032147`
+- Added larger deterministic supervised grid trace:
+  - testbench: `tb/tb_supervised_grid_trace.sv`
+  - checker: `scripts/check_supervised_grid_trace.py`
+  - smoke output: `runs/supervised_grid_2_4_3.csv`
+  - command: `./scripts/run_test.sh tb/tb_supervised_grid_trace.sv tb_supervised_grid_trace -GK0=3 -GK1=4 -GK2=2 -GNUM_SAMPLES=8 -- +CSV=runs/supervised_grid_2_4_3.csv +EPOCHS=2 +INFER_TICKS=8 +LEARN_TICKS=2 +EVAL_TICKS=12 +ALPHA=0.05 +GAMMA=0.10`
+  - command: `/home/gregoryv/miniconda3/envs/dsl2/bin/python scripts/check_supervised_grid_trace.py --csv runs/supervised_grid_2_4_3.csv --k0 3 --k1 4 --k2 2 --samples 8 --epochs 2 --infer-ticks 8 --learn-ticks 2 --eval-ticks 12 --alpha 0.05 --gamma 0.10`
+  - result: `PASS supervised grid RTL learning curve matches PCNetNLayer`
+  - max absolute MSE error: `2.65814719e-09`
+- Added larger supervised grid/config sweep:
+  - script: `scripts/exp_rtl_supervised_grid_sweep.py`
+  - summary: `runs/rtl_supervised_grid_sweep_summary.csv`
+  - command: `/home/gregoryv/miniconda3/envs/dsl2/bin/python scripts/exp_rtl_supervised_grid_sweep.py`
+  - cases passed:
+    - `3->4->2`, samples `8`, epochs `2`, max abs `2.65814719e-09`, final MSE `0.082509124`
+    - `4->8->4`, samples `12`, epochs `2`, max abs `3.09789143e-09`, final MSE `0.093101249`
+    - `6->12->6`, samples `16`, epochs `2`, max abs `2.07259142e-09`, final MSE `0.090901162`
+    - `8->16->8`, samples `16`, epochs `1`, max abs `1.3349893e-09`, final MSE `0.124669507`
+- Added first CartPole/Pendulum-shaped RTL trace sweep:
+  - script: `scripts/exp_rtl_task_shape_trace_sweep.py`
+  - summary: `runs/rtl_task_shape_trace_sweep_summary.csv`
+  - command: `/home/gregoryv/miniconda3/envs/dsl2/bin/python scripts/exp_rtl_task_shape_trace_sweep.py`
+  - cases passed:
+    - CartPole value/policy shape `4->16->2`: max abs `7.38049913e-10`, final MSE `0.071451252`
+    - Pendulum actor shape `3->16->1`: max abs `1.20858831e-09`, final MSE `0.139430820`
+    - Pendulum critic shape `4->16->1`: max abs `1.28952729e-09`, final MSE `0.094898385`
+  - This is still a deterministic supervised trace, not a full environment-loop RL trace. Its purpose is to verify that the RTL/Python tick agreement holds on CartPole/Pendulum network geometry before using frozen RL batches.
+- Added frozen CartPole/Pendulum environment-loop trace:
+  - file-driven RTL testbench: `tb/tb_supervised_file_trace.sv`
+  - checker: `scripts/check_supervised_file_trace.py`
+  - exporter/runner: `scripts/exp_rtl_frozen_env_trace.py`
+  - summary: `runs/rtl_frozen_env_trace_summary.csv`
+  - frozen data:
+    - `runs/rtl_frozen_env_trace/data/cartpole_value_frozen_seed42.dat`
+    - `runs/rtl_frozen_env_trace/data/pendulum_actor_frozen_seed42.dat`
+    - `runs/rtl_frozen_env_trace/data/pendulum_critic_frozen_seed42.dat`
+  - command: `/home/gregoryv/miniconda3/envs/dsl2/bin/python scripts/exp_rtl_frozen_env_trace.py`
+  - cases passed:
+    - CartPole value frozen env samples, shape `4->16->2`: max abs `4.06842654e-09`, final MSE `0.249856610`
+    - Pendulum actor frozen env samples, shape `3->16->1`: max abs `2.14315032e-09`, final MSE `0.298410560`
+    - Pendulum critic frozen env samples, shape `4->16->1`: max abs `4.29959952e-09`, final MSE `0.016835963`
+  - The rows come from actual Gym/Gymnasium environment transitions:
+    - CartPole value rows: observation plus one-step action-value target for the sampled action.
+    - Pendulum actor rows: observation plus normalized sampled continuous action.
+    - Pendulum critic rows: observation/action plus scaled one-step reward target.
+- Added true frozen runner update-batch trace:
+  - exporter/runner: `scripts/exp_rtl_runner_batch_trace.py`
+  - summary: `runs/rtl_runner_batch_trace_summary.csv`
+  - frozen data:
+    - `runs/rtl_runner_batch_trace/data/cartpole_value_td_batch_seed42.dat`
+    - `runs/rtl_runner_batch_trace/data/cartpole_policy_aif_batch_seed42.dat`
+    - `runs/rtl_runner_batch_trace/data/pendulum_pc_critic_td_batch_seed42.dat`
+  - command: `/home/gregoryv/miniconda3/envs/dsl2/bin/python scripts/exp_rtl_runner_batch_trace.py`
+  - cases passed:
+    - CartPole value TD batch, shape `4->16->2`: max abs `8.20470414e-09`, final MSE `0.242037104`
+    - CartPole policy AIF target-logit batch, shape `4->16->2`: max abs `5.7368033e-08`, final MSE `0.004131879`
+    - Pendulum PC critic TD batch, shape `4->16->1`: max abs `3.13335337e-10`, final MSE `0.001333264`
+  - These batches use the same target equations as the live runners:
+    - CartPole value: `r + discount * sum(pi(next_state) * V_target(next_state))`, inserted into the sampled action slot.
+    - CartPole policy: AIF-style target logits from value preferences using the runner's greedy-smoothed target convention.
+    - Pendulum PC critic: DDPG target `reward + discount * (1-done) * critic_target(next_state, actor_target(next_state))`, normalized by `q_scale` to match `PCCritic.exactlocal_update`.
+- Added first online/multi-update runner trace:
+  - exporter/runner: `scripts/exp_rtl_runner_update_sequence.py`
+  - summary: `runs/rtl_runner_update_sequence_summary.csv`
+  - manifest: `runs/rtl_runner_update_sequence/data/cartpole_value_td_sequence_seed42_manifest.txt`
+  - command: `/home/gregoryv/miniconda3/envs/dsl2/bin/python scripts/exp_rtl_runner_update_sequence.py`
+  - sequence: four deterministic CartPole value TD update batches, each with 12 samples, using the runner's target equation.
+  - cases passed:
+    - update `0`: max abs `2.86839303e-08`, final MSE `0.258909244`
+    - update `1`: max abs `2.87485574e-09`, final MSE `0.336477584`
+    - update `2`: max abs `3.0218964e-09`, final MSE `0.349891823`
+    - update `3`: max abs `2.79369883e-09`, final MSE `0.314877582`
+  - Current implementation runs each update as a separate RTL sim invocation for isolation. A future persistent tracebench should carry one RTL network state across the full update sequence.
+- Added persistent multi-update runner trace:
+  - persistent RTL testbench: `tb/tb_supervised_sequence_file_trace.sv`
+  - persistent checker: `scripts/check_supervised_sequence_file_trace.py`
+  - exporter/runner: `scripts/exp_rtl_runner_persistent_sequence.py`
+  - summary: `runs/rtl_runner_persistent_sequence_summary.csv`
+  - output curves:
+    - `runs/rtl_runner_persistent_sequence/cartpole_value_td_persistent_sequence_seed42.csv`
+    - `runs/rtl_runner_persistent_sequence/cartpole_policy_aif_persistent_sequence_seed42.csv`
+    - `runs/rtl_runner_persistent_sequence/pendulum_pc_critic_td_persistent_sequence_seed42.csv`
+  - command: `/home/gregoryv/miniconda3/envs/dsl2/bin/python scripts/exp_rtl_runner_persistent_sequence.py`
+  - sequence: one RTL `pc_network_nlayer` instance carries state/weights across four deterministic update batches, each with 12 samples.
+  - cases passed:
+    - CartPole value TD persistent sequence, shape `4->16->2`: max abs `3.73348187e-08`, final MSE `0.243638748`
+    - CartPole policy AIF persistent sequence, shape `4->16->2`: max abs `1.45879438e-07`, final MSE `0.001041235`
+    - Pendulum PC critic TD persistent sequence, shape `4->16->1`: max abs `1.03066501e-09`, final MSE `0.001557986`
+  - persistent MSE curves:
+    - CartPole value: `0.525735244 -> 0.336966119 -> 0.252845903 -> 0.248685594 -> 0.243638748`
+    - CartPole policy: `3.793230723 -> 0.534438511 -> 0.067734248 -> 0.009951652 -> 0.001041235`
+    - Pendulum PC critic: `0.006267264 -> 0.001874826 -> 0.001810860 -> 0.000870987 -> 0.001557986`
+  - Depth/width finding: `pc_network_nlayer` is structurally N-layer, but the current RTL `theta_init_pkg.sv` only provides nonzero random presets for `THETA_L0` and `THETA_L1`; layers `ul >= 2` instantiate with zero theta presets. Faithful 4-layer/two-hidden MuJoCo traces therefore need an initializer/preset upgrade before they can match the current two-hidden TD3/PC critics.
+- Added deeper initializer/preset path:
+  - generator: `scripts/gen_theta_init_pkg.py`
+  - regenerated package: `rtl/includes/theta_init_pkg.sv`
+  - new generation K_LUT: `[8, 16, 16, 32]`
+  - RTL change: `rtl/nc_neuralcomputer.sv` now routes `THETA_L2` into `pc_network_nlayer` when `ul == 2 && NUM_LAYERS > 3`, while preserving zero theta presets for the top clamped layer / unsupported deeper layers.
+  - Python checkers were updated to use matching expanded generation prefixes:
+    - 3-layer traces use `gen_k_lut=[8,16,16]`
+    - 4-layer traces use `gen_k_lut=[8,16,16,32]`
+  - 3-layer persistent regression after this initializer change passed:
+    - CartPole value TD persistent sequence: max abs `5.88510995e-09`, final MSE `0.246831646`
+    - CartPole policy AIF persistent sequence: max abs `9.37988452e-08`, final MSE `0.002029657`
+    - Pendulum PC critic TD persistent sequence: max abs `2.45820474e-09`, final MSE `0.001058727`
+- Added first 4-layer/two-hidden persistent trace:
+  - RTL testbench: `tb/tb_supervised_sequence_file_trace4.sv`
+  - checker: `scripts/check_supervised_sequence_file_trace4.py`
+  - runner: `scripts/exp_rtl_four_layer_sequence.py`
+  - summary: `runs/rtl_four_layer_sequence_summary.csv`
+  - current full-trace command: `/home/gregoryv/miniconda3/envs/dsl2/bin/python scripts/exp_rtl_four_layer_sequence.py --hidden-widths 16,32,64`
+  - current 128 smoke command: `/home/gregoryv/miniconda3/envs/dsl2/bin/python scripts/exp_rtl_four_layer_sequence.py --hidden-widths 128 --data-kinds synthetic,halfcheetah_q,halfcheetah_aif --updates 1 --samples-per-update 1 --infer-ticks 1 --learn-ticks 1 --eval-ticks 1 --reuse-existing`
+  - shapes: `1 -> H -> H -> 23`, matching HalfCheetah critic output width and state+action input width at reduced hidden sizes.
+  - runner now accepts selectable widths/data kinds and can reuse existing CSV traces:
+    - `--hidden-widths 16,32,64`
+    - `--data-kinds synthetic,halfcheetah_q,halfcheetah_aif`
+    - `--updates N`
+    - `--samples-per-update N`
+    - `--infer-ticks N`
+    - `--learn-ticks N`
+    - `--eval-ticks N`
+    - `--reuse-existing`
+    - `--verilator-build-jobs N`
+    - `--verilator-verilate-jobs N`
+    - `--verilator-output-split N`
+    - `--verilator-output-split-cfuncs N`
+    - `--no-cache-binaries`
+  - `scripts/run_test.sh` now also honors these environment variables for large generated models:
+    - `VERILATOR_MDIR`
+    - `VERILATOR_REUSE_BINARY`
+    - `VERILATOR_BUILD_JOBS`
+    - `VERILATOR_VERILATE_JOBS`
+    - `VERILATOR_THREADS`
+    - `VERILATOR_OUTPUT_SPLIT`
+    - `VERILATOR_OUTPUT_SPLIT_CFUNCS`
+  - The four-layer runner now caches Verilated binaries per width and sequence shape in `obj_dir/trace4_*` directories by default. This avoids recompiling the same `H` network for synthetic/Q/AIF data and should cut a full three-case width sweep by roughly the number of data cases.
+  - regenerated theta package was widened to generation K_LUT `[8, 256, 256, 32]`; Python checkers/oracles were updated to the same generation prefix. This supports hidden widths `128` and `256`.
+  - cases passed:
+    - width `16`, synthetic 4-layer regression: max abs `6.26897977e-07`, final MSE `0.002085381`
+    - width `16`, actual HalfCheetah TD3-Q frozen batch: max abs `7.02192241e-05`, final MSE `0.728824927`
+    - width `16`, actual HalfCheetah AIF `G=-Q` frozen batch: max abs `0.000182388266`, final MSE `0.261830507`
+    - width `32`, synthetic 4-layer regression: max abs `6.5555467e-08`, final MSE `0.002214951`
+    - width `32`, actual HalfCheetah TD3-Q frozen batch: max abs `0.000118721548`, final MSE `0.670309443`
+    - width `32`, actual HalfCheetah AIF `G=-Q` frozen batch: max abs `0.000102077859`, final MSE `0.135951562`
+    - width `64`, synthetic 4-layer regression: max abs `5.5355905e-07`, final MSE `0.003572798`
+    - width `64`, actual HalfCheetah TD3-Q frozen batch: max abs `8.30568432e-05`, final MSE `0.618543396`
+    - width `64`, actual HalfCheetah AIF `G=-Q` frozen batch: max abs `2.48188172e-05`, final MSE `0.054633508`
+    - width `128` smoke, synthetic 4-layer regression, updates/samples/ticks `1/1/1`: max abs `1.24461404e-10`, final MSE `0.000004768`
+    - width `128` smoke, actual HalfCheetah TD3-Q frozen batch, updates/samples/ticks `1/1/1`: max abs `7.25637955e-09`, final MSE `0.000052739`
+    - width `128` smoke, actual HalfCheetah AIF `G=-Q` frozen batch, updates/samples/ticks `1/1/1`: max abs `1.5989312e-08`, final MSE `0.001386633`
+    - width `128`, normal ticks `8/2/10`, `1 update x 1 sample`, synthetic: max abs `1.52381421e-07`, final MSE `0.000007240`
+    - width `128`, normal ticks `8/2/10`, `1 update x 1 sample`, HalfCheetah TD3-Q: max abs `1.91700623e-05`, final MSE `0.018443976`
+    - width `128`, normal ticks `8/2/10`, `1 update x 1 sample`, HalfCheetah AIF `G=-Q`: max abs `2.41815802e-05`, final MSE `0.142681403`
+    - width `128`, normal ticks `8/2/10`, `1 update x 2 samples`, synthetic: max abs `1.24268052e-07`, final MSE `0.001793740`
+    - width `128`, normal ticks `8/2/10`, `1 update x 2 samples`, HalfCheetah TD3-Q: max abs `0.000474436313`, final MSE `1.106590950`
+    - width `128`, normal ticks `8/2/10`, `1 update x 2 samples`, HalfCheetah AIF `G=-Q`: max abs `6.66155995e-05`, final MSE `0.411250396`
+    - width `128`, normal ticks `8/2/10`, `1 update x 3 samples`, synthetic: max abs `4.84808068e-07`, final MSE `0.002802972`
+    - width `128`, normal ticks `8/2/10`, `1 update x 3 samples`, HalfCheetah TD3-Q: max abs `0.000214733524`, final MSE `0.534056672`
+    - width `128`, normal ticks `8/2/10`, `1 update x 3 samples`, HalfCheetah AIF `G=-Q`: max abs `6.15506469e-05`, final MSE `0.351076445`
+  - Raw HalfCheetah observations/actions required reducing the local trace learning rate from `alpha=0.02` to `alpha=0.002` for stable float32 RTL-vs-Python agreement. No observation normalization was used in the passing Q/AIF cases.
+  - The AIF batch uses the runner's TD3/AIF target convention and clamps the RTL bottom state to the PC critic's internal normalized raw target, i.e. `target_raw = -target_G` under signed EFE semantics.
+  - Width-scaling note:
+    - Width `32` compiles and simulates, but Verilator compilation is already heavy: one `32` synthetic build took about `282s`, produced a `267.7 MB` generated model, and simulation took about `27s`.
+    - Width `64` also passes, but the harness is now very heavy: one `64` AIF build took about `702s`, produced a `691.1 MB` generated model across `837` C++ files, and simulation took about `151s`.
+    - Width `128` now instantiates and passes synthetic/Q/AIF at normal `8/2/10` ticks through `1 update x 3 samples` after widening theta to `[8,256,256,32]`. The full `2 updates x 6 samples x 8/2/10 ticks` simulation at width `128` compiled but was too slow for a quick probe.
+    - Parallel Verilator build knobs were added after the width-64 pass. A hidden `256` minimal smoke was attempted with `1 update x 1 sample x 1/1/1 ticks`. The dataset was staged successfully, but Verilator did not finish codegen/build within a 15-minute diagnostic timeout and did not emit the build directory/binary. The visible diagnostic warning was only the wide-bus `WIDTHCONCAT` warning on clearing `x_obs_flat_all` (`32768` bits), not a PC dynamics mismatch.
+    - The next clean probe is either `2 updates x 3 samples` at hidden `128`, or a slimmer/dedicated hidden `256` testbench that reduces TB-wide packed bus/codegen burden before trying the full `256` smoke again.
+    - The next clean step is not just "try 256"; it is to make the RTL simulation harness more scalable or move to actual hardware/synthesis-style validation, then run full hidden `256`.
+- After the full hidden-256 Verilator path proved too heavy, a compositional contract verification lane was added:
+  - primitive RTL testbench: `tb/tb_neuron_contract_trace.sv`
+  - checker: `scripts/check_neuron_contract_trace.py`
+  - runner: `scripts/exp_rtl_contract_sweep.py`
+  - summary: `runs/rtl_contract_sweep_summary.csv`
+  - command: `/home/gregoryv/miniconda3/envs/dsl2/bin/python scripts/exp_rtl_contract_sweep.py`
+  - purpose: verify scaling-sensitive neuron contracts directly instead of requiring full-network Verilator elaboration for every large/deep shape.
+  - cases passed:
+    - `fanin_64`: `N=64`, `M=1`, linear, max abs `7.31845474e-09`
+    - `fanin_128`: `N=128`, `M=1`, linear, max abs `4.90699772e-10`
+    - `fanin_256`: `N=256`, `M=1`, linear, max abs `5.56695938e-10`
+    - `backflow_64`: `N=1`, `M=64`, linear, max abs `4.65579991e-10`
+    - `backflow_128`: `N=1`, `M=128`, linear, max abs `4.93107259e-10`
+    - `backflow_256`: `N=1`, `M=256`, linear, max abs `4.65579991e-10`
+    - `balanced_64`: `N=64`, `M=64`, linear, max abs `7.31845474e-09`
+    - `relu_fanin_256`: `N=256`, `M=1`, ReLU, max abs `4.13123607e-10`
+  - cache sizes were practical:
+    - `obj_dir/contract_fanin_256`: about `161 MB`
+    - `obj_dir/contract_backflow_256`: about `146 MB`
+    - `obj_dir/contract_relu_fanin_256`: about `161 MB`
+  - interpretation: the large fan-in and large backflow neuron contracts match the Python oracle at 256 scale. The full `1 -> 256 -> 256 -> 23` Verilator problem is therefore much more likely an all-at-once structural elaboration/build scaling issue than a local PC equation issue.
+  - New scalable verification strategy:
+    - use primitive contract tests for large fan-in/backflow
+    - use small/deep `pc_network_nlayer` traces for scheduler/boundary timing
+    - use reduced-width full network traces for end-to-end learning curves
+    - reserve full 256 all-at-once RTL for synthesis/hardware validation or a much more simulator-friendly implementation.
+- Added the next compositional tier: `pc_layer` tile contracts.
+  - layer-tile RTL testbench: `tb/tb_layer_contract_trace.sv`
+  - checker: `scripts/check_layer_contract_trace.py`
+  - runner: `scripts/exp_rtl_layer_contract_sweep.py`
+  - summary: `runs/rtl_layer_contract_sweep_summary.csv`
+  - command: `/home/gregoryv/miniconda3/envs/dsl2/bin/python scripts/exp_rtl_layer_contract_sweep.py`
+  - purpose: verify several neurons running in parallel with shared 256-wide presynaptic input or 256-wide backflow, without elaborating the full 256/256 network.
+  - cases passed:
+    - `tile_k2_fanin_256`: `K=2`, `N=256`, `M=1`, linear, max abs `6.13927841e-11`
+    - `tile_k4_fanin_256`: `K=4`, `N=256`, `M=1`, linear, max abs `6.13927841e-11`
+    - `tile_k8_fanin_256`: `K=8`, `N=256`, `M=1`, linear, max abs `6.64964318e-11`
+    - `tile_k2_backflow_256`: `K=2`, `N=1`, `M=256`, linear, max abs `5.43147326e-11`
+    - `tile_k4_backflow_256`: `K=4`, `N=1`, `M=256`, linear, max abs `5.99771738e-11`
+    - `tile_k4_balanced_64`: `K=4`, `N=64`, `M=64`, linear, max abs `1.32992864e-10`
+    - `tile_k4_relu_fanin_256`: `K=4`, `N=256`, `M=1`, ReLU, max abs `0`
+  - cache sizes remained practical:
+    - `obj_dir/layer_contract_tile_k4_fanin_256`: about `219 MB`
+    - `obj_dir/layer_contract_tile_k8_fanin_256`: about `293 MB`
+    - `obj_dir/layer_contract_tile_k4_backflow_256`: about `184 MB`
+  - interpretation: this bridges the gap between single-neuron contracts and whole-network composition. Multiple RTL neurons running in parallel over 256-wide inputs/backflow match the Python oracle. Full 256/256 Verilator remains unnecessary as the primary proof vehicle unless the simulation model is redesigned for whole-fabric compilation.
+- Added narrow/deep scheduler contract traces:
+  - RTL testbench: `tb/tb_deep_scheduler_trace.sv`
+  - checker: `scripts/check_deep_scheduler_trace.py`
+  - runner: `scripts/exp_rtl_deep_scheduler_sweep.py`
+  - summary: `runs/rtl_deep_scheduler_sweep_summary.csv`
+  - command: `/home/gregoryv/miniconda3/envs/dsl2/bin/python scripts/exp_rtl_deep_scheduler_sweep.py --tol 1e-4`
+  - shapes passed:
+    - `1->8->8->8->23`, five layers, max abs `4.96509573e-05`
+    - `1->16->16->16->23`, five layers, max abs `5.59074529e-05`
+  - cache sizes:
+    - `obj_dir/deep_scheduler_h8`: about `260 MB`
+    - `obj_dir/deep_scheduler_h16`: about `364 MB`
+  - interpretation: multi-layer simultaneous tick scheduling and boundary timing compose across deeper networks without requiring full 256 width.
+- Added initializer/index mapping check:
+  - script: `scripts/check_theta_init_mapping.py`
+  - command: `/home/gregoryv/miniconda3/envs/dsl2/bin/python scripts/check_theta_init_mapping.py`
+  - result: `PASS theta_init_pkg selected indices match Python RNG mapping`
+  - probes: `15`, failures: `0`
+  - checked selected boundary and mid indices for `THETA_L0`, `THETA_L1`, and `THETA_L2`, including index `0`, `127`, `255` where applicable.
+  - interpretation: the generated theta package matches the Python RNG recipe bit-for-bit at selected full-256 boundary indices, reducing risk of hidden init/index mapping errors in the compositional argument.
+- Added full-fabric 256/256 structural elaboration proof:
+  - synthesis/elaboration top: `rtl/synth_pcnet_256_top.sv`
+  - Yosys script/checker was attempted:
+    - `scripts/synth_pcnet_256_yosys.ys`
+    - `scripts/check_synth_pcnet_256.py`
+    - installed Yosys is old (`0.9`) and cannot parse the repo's SystemVerilog style (`input logic` in `rtl/hf_mac32.sv`), so Yosys is not the usable proof vehicle in this environment without translation/tool upgrade.
+  - Verilator structural elaboration, no C++ build, succeeded:
+    - command class: `verilator --xml-only --stats ... --top-module synth_pcnet_256_top`
+    - summary: `runs/synth/pcnet_256_elaboration_summary.md`
+    - XML: `runs/synth/pcnet_256.xml`
+    - log: `runs/synth/pcnet_256_verilator_xml.log`
+    - stats: `obj_dir/verilator_xml_256/Vsynth_pcnet_256_top__stats.txt`
+  - key result:
+    - shape: `1 -> 256 -> 256 -> 23`
+    - Verilog modules read: `50`
+    - C++ files built: `0`
+    - walltime: `121.089s`
+    - elaboration: `23.112s`
+    - conversion: `83.469s`
+    - peak allocation: `9374.984 MB`
+    - XML size: `844 MB`
+    - unrolled iterations: `539880`
+    - unrolled loops: `4307`
+  - interpretation: the full 256/256 RTL fabric structurally elaborates without width/index/generate failure. The previous failures are specifically the full C++ simulation build path, not RTL hierarchy elaboration.
+
+Interpretation:
+
+- The single-neuron RTL primitive is now directly verified against the Python equation oracle.
+- Frozen CartPole/Pendulum environment-loop samples, true frozen runner update batches, isolated multi-update traces, persistent carried-state sequences, and actual HalfCheetah TD3-Q/AIF frozen batches now pass RTL-vs-Python learning-curve alignment at hidden widths `16`, `32`, and `64`, plus a minimal hidden `128` smoke. The next step toward full HalfCheetah is lengthening the `128` trace, then hidden `256`, followed by longer/more update sequences.
+- Scaling note: RTL already has `pc_network_nlayer`, and Python now has `PCNetNLayer`. Deterministic 3-layer network tracing, a small rate/activation sweep, deterministic fixed-dataset supervised learning alignment, schedule/rate sweeps, larger supervised config sweeps, CartPole/Pendulum-shaped supervised traces, frozen environment-sample traces, frozen runner-batch traces, isolated runner update sequences, persistent runner update sequences, and reduced-width 4-layer traces pass.
+- Important conceptual boundary: the existing RTL implements the paper’s local predictive-coding tick dynamics. The MuJoCo HalfCheetah success currently uses the BP-equivalent PC bridge. To physically verify the full inference-engine story, either show the RTL-faithful tick dynamics can reproduce the smaller tasks and then scale, or add the BP-equivalent/nudged mode into RTL as an explicitly verified hardware mode.
+
 ## Constraints / Tooling Note
 
 This local environment does **not** currently expose a direct GitHub repository-creation action.

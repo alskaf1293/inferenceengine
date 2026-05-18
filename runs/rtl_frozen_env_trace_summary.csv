@@ -1,0 +1,4 @@
+case,kind,k0,k1,k2,samples,seed,epochs,infer_ticks,learn_ticks,eval_ticks,alpha,gamma,max_abs_error,final_mse,status,data,csv
+cartpole_value_frozen_seed42,cartpole_value,2,16,4,24,42,2,10,2,16,0.03,0.06,4.06842654e-09,0.249856610,pass,runs/rtl_frozen_env_trace/data/cartpole_value_frozen_seed42.dat,runs/rtl_frozen_env_trace/cartpole_value_frozen_seed42.csv
+pendulum_actor_frozen_seed42,pendulum_actor,1,16,3,24,42,2,10,2,16,0.03,0.06,2.14315032e-09,0.298410560,pass,runs/rtl_frozen_env_trace/data/pendulum_actor_frozen_seed42.dat,runs/rtl_frozen_env_trace/pendulum_actor_frozen_seed42.csv
+pendulum_critic_frozen_seed42,pendulum_critic,1,16,4,24,42,2,10,2,16,0.03,0.06,4.29959952e-09,0.016835963,pass,runs/rtl_frozen_env_trace/data/pendulum_critic_frozen_seed42.dat,runs/rtl_frozen_env_trace/pendulum_critic_frozen_seed42.csv

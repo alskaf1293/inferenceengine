@@ -1,0 +1,2 @@
+case,kind,k0,k1,k2,k3,updates,samples_per_update,max_abs_error,tol,final_mse,status,data,csv
+halfcheetah_aif_td_batch_1_128_128_23,halfcheetah_aif,1,128,128,23,2,3,6.15506469e-05,0.001,0.135908432,pass,runs/rtl_four_layer_sequence/halfcheetah_aif_td_batch_1_128_128_23.dat,runs/rtl_four_layer_sequence/halfcheetah_aif_td_batch_1_128_128_23.csv

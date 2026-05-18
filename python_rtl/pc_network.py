@@ -8,6 +8,7 @@ RTL correspondence:
   Neuron      → neuron_core_single_back   (states: PRED→ERR→BACKSUM→BACKVEC→WUP→STATE)
   Layer       → pc_layer                  (vectorised across k neurons)
   PCNet3Layer → pc_network_nlayer (3-layer specialisation)
+  PCNetNLayer → pc_network_nlayer (general bottom-to-top stack)
 
 Key design notes:
   • Activation (phi) is the CURRENT layer's function applied to x_up
@@ -17,6 +18,10 @@ Key design notes:
   • Weight init: Gaussian(0, 0.1) per layer, matching theta_init_pkg.sv.
   • bias_lr_scale=1.0 matches RTL BIAS_LR_SCALE default.
   • Layer.tick() is fully vectorised (numpy matrix ops) for performance.
+  • PCNet3Layer.tick_parallel() snapshots inter-layer state/backflow before
+    committing each layer, matching pc_network_nlayer's simultaneous start_tick.
+  • PCNetNLayer is the N-layer reference path; PCNet3Layer remains unchanged
+    for existing experiments.
   • Arithmetic is float64 (RTL uses float32 recFN); results are qualitatively
     faithful but not bit-exact.
 """
@@ -272,11 +277,11 @@ class PCNet3Layer:
         ----------
         rtl_init  : use float32-cast Gaussian weights matching gen_theta_init_pkg.py.
         gen_k_lut : generation K_LUT used to draw the full weight block before
-                    slicing to k_lut.  gen_theta_init_pkg.py defaults to [8,16,8],
-                    so the RTL's theta_init_pkg.sv always has that shape and the
-                    testbench uses the top-left [0:k0,0:k1] / [0:k1,0:k2] slice.
-                    Set this to [8,16,8] (or whatever gen_theta_init_pkg.py was
-                    run with) to reproduce RTL weight values exactly.
+                    slicing to k_lut. gen_theta_init_pkg.py now defaults to the
+                    deeper [8,256,256,32] package; 3-layer RTL checks use the
+                    matching prefix [8,64,64] so L0/L1 consume the same RNG stream.
+                    Set this to the package prefix for the topology under test to
+                    reproduce RTL weight values exactly.
                     If None, draws exactly (k0,k1) and (k1,k2) — different RNG
                     samples, different dynamics.
         """
@@ -377,7 +382,238 @@ class PCNet3Layer:
             obs_vec        = obs0,
         )
 
+    def tick_parallel(self,
+                      x_top:        np.ndarray,
+                      y_bottom:     Optional[np.ndarray],
+                      clamp_top:    bool = True,
+                      clamp_bottom: bool = False,
+                      ) -> None:
+        """One PC tick with RTL network-level boundary timing.
+
+        The RTL broadcasts start_tick to all layers. Each neuron snapshots its
+        presynaptic x_vec at the start of the tick, while the back vectors wired
+        from lower layers are the vectors visible at that tick boundary. This
+        method preserves that simultaneous boundary by copying layer states and
+        back matrices before committing any layer's update.
+        """
+        k0, k1, k2 = self.k_lut
+        x1_prev = self.layer1.x_state.copy()
+        x2_prev = np.asarray(x_top, dtype=np.float64) if clamp_top else self.layer2.x_state.copy()
+        back0_prev = self.layer0.back_nk.copy()
+        back1_prev = self.layer1.back_nk.copy()
+
+        obs0 = np.asarray(y_bottom, dtype=np.float64) if y_bottom is not None else np.zeros(k0)
+
+        self.layer0.tick(
+            x_up           = x1_prev,
+            back_from_down = np.zeros((k0, 0)),
+            clamp_vec      = np.ones(k0, dtype=bool) if clamp_bottom and y_bottom is not None
+                             else np.zeros(k0, dtype=bool),
+            obs_vec        = obs0,
+        )
+
+        self.layer1.tick(
+            x_up           = x2_prev,
+            back_from_down = back0_prev,
+            clamp_vec      = np.zeros(k1, dtype=bool),
+            obs_vec        = np.zeros(k1),
+        )
+
+        self.layer2.tick(
+            x_up           = np.zeros(0),
+            back_from_down = back1_prev,
+            clamp_vec      = np.ones(k2, dtype=bool) if clamp_top else np.zeros(k2, dtype=bool),
+            obs_vec        = np.asarray(x_top, dtype=np.float64),
+        )
+
     @property
     def x0(self) -> np.ndarray:
         """Bottom-layer state — the network's output prediction."""
         return self.layer0.x_state.copy()
+
+
+# ── General N-layer PC network for RTL-aligned traces ─────────────────────────
+
+class PCNetNLayer:
+    """
+    General pc_network_nlayer reference.
+
+    Layer numbering matches RTL K_LUT / ACT_LUT indexing:
+      layer 0      : bottom / output
+      layer L - 1  : top / input
+
+    This class is intentionally separate from PCNet3Layer so existing 3-layer
+    experiments keep their current semantics.  Use tick_parallel() for RTL
+    boundary timing: every layer sees states and back vectors from the tick
+    boundary before any layer commits its update.
+    """
+    def __init__(self, k_lut: list[int], act_lut: list[str],
+                 wclip: float = 20.0,
+                 xclip_lut: Optional[list[Optional[float]]] = None,
+                 eps_clip_lut: Optional[list[Optional[float]]] = None,
+                 gamma: float = 0.1,
+                 alpha: float = 0.05,
+                 bias_lr_scale: float = 1.0,
+                 seed: Optional[int] = None,
+                 rtl_init: bool = True,
+                 gen_k_lut: Optional[list[int]] = None,
+                 bias_init_scale: float = 0.0,
+                 top_rtl_width: bool = True):
+        if len(k_lut) < 1:
+            raise ValueError("k_lut must contain at least one layer")
+        if len(k_lut) != len(act_lut):
+            raise ValueError("k_lut and act_lut must have the same length")
+
+        self.k_lut = list(k_lut)
+        self.act_lut = list(act_lut)
+        self.num_layers = len(k_lut)
+        self.top_rtl_width = top_rtl_width
+
+        xclip_lut = [None] * self.num_layers if xclip_lut is None else list(xclip_lut)
+        eps_clip_lut = [None] * self.num_layers if eps_clip_lut is None else list(eps_clip_lut)
+        if len(xclip_lut) != self.num_layers or len(eps_clip_lut) != self.num_layers:
+            raise ValueError("clip LUTs must match number of layers")
+
+        rng = np.random.default_rng(seed if seed is not None else 0)
+        gk = list(gen_k_lut) if gen_k_lut is not None else list(k_lut)
+        if len(gk) != self.num_layers:
+            raise ValueError("gen_k_lut must match number of layers")
+
+        import struct as _struct
+        x_init = float(_struct.unpack('>f', _struct.pack('>I', 0x3A83126F))[0])
+
+        def layer_n(layer_idx: int) -> int:
+            if self.num_layers == 1:
+                return self.k_lut[0] if top_rtl_width else 0
+            if layer_idx == self.num_layers - 1:
+                return self.k_lut[layer_idx - 1] if top_rtl_width else 0
+            return self.k_lut[layer_idx + 1]
+
+        def layer_m(layer_idx: int) -> int:
+            return 0 if layer_idx == 0 else self.k_lut[layer_idx - 1]
+
+        def rinit(layer_idx: int, k: int, n: int) -> np.ndarray:
+            if layer_idx == self.num_layers - 1:
+                return np.zeros((k, n), dtype=np.float64)
+            raw = rng.standard_normal((gk[layer_idx], gk[layer_idx + 1]))
+            if rtl_init:
+                full = (raw.astype(np.float32) * np.float32(0.1)).astype(np.float64)
+            else:
+                full = raw * 0.1
+            return full[:k, :n]
+
+        def binit(k: int, is_top: bool) -> Optional[np.ndarray]:
+            if bias_init_scale == 0.0 or is_top:
+                return None
+            raw = rng.standard_normal(k)
+            if rtl_init:
+                return (raw.astype(np.float32) * np.float32(bias_init_scale)).astype(np.float64)
+            return raw * bias_init_scale
+
+        self.layers: list[Layer] = []
+        for layer_idx, k in enumerate(self.k_lut):
+            n = layer_n(layer_idx)
+            m = layer_m(layer_idx)
+            is_top = layer_idx == self.num_layers - 1
+            self.layers.append(
+                Layer(k, n, m, rinit(layer_idx, k, n), act_lut[layer_idx],
+                      wclip, xclip_lut[layer_idx], eps_clip_lut[layer_idx],
+                      gamma, alpha, bias_lr_scale, x_init=float(x_init),
+                      bias_init=binit(k, is_top))
+            )
+
+    def set_rates(self, alpha: float, gamma: float) -> None:
+        for layer in self.layers:
+            layer.set_rates(alpha, gamma)
+
+    def reset_state(self) -> None:
+        for layer in self.layers:
+            layer.reset_state()
+
+    def _default_clamps_and_obs(self,
+                                x_top: Optional[np.ndarray],
+                                y_bottom: Optional[np.ndarray],
+                                clamp_top: bool,
+                                clamp_bottom: bool,
+                                clamp_lut: Optional[list[np.ndarray]],
+                                obs_lut: Optional[list[np.ndarray]]
+                                ) -> tuple[list[np.ndarray], list[np.ndarray]]:
+        clamps = [np.zeros(k, dtype=bool) for k in self.k_lut]
+        obs = [np.zeros(k, dtype=np.float64) for k in self.k_lut]
+
+        if clamp_lut is not None:
+            if len(clamp_lut) != self.num_layers:
+                raise ValueError("clamp_lut must match number of layers")
+            clamps = [np.asarray(c, dtype=bool) for c in clamp_lut]
+        if obs_lut is not None:
+            if len(obs_lut) != self.num_layers:
+                raise ValueError("obs_lut must match number of layers")
+            obs = [np.asarray(o, dtype=np.float64) for o in obs_lut]
+
+        if x_top is not None:
+            top = self.num_layers - 1
+            obs[top] = np.asarray(x_top, dtype=np.float64)
+            if clamp_top:
+                clamps[top] = np.ones(self.k_lut[top], dtype=bool)
+
+        if y_bottom is not None:
+            obs[0] = np.asarray(y_bottom, dtype=np.float64)
+            if clamp_bottom:
+                clamps[0] = np.ones(self.k_lut[0], dtype=bool)
+
+        for idx, (c, o, k) in enumerate(zip(clamps, obs, self.k_lut)):
+            if c.shape != (k,) or o.shape != (k,):
+                raise ValueError(f"layer {idx} clamp/obs shape mismatch")
+        return clamps, obs
+
+    def tick_parallel(self,
+                      x_top: Optional[np.ndarray] = None,
+                      y_bottom: Optional[np.ndarray] = None,
+                      clamp_top: bool = True,
+                      clamp_bottom: bool = False,
+                      clamp_lut: Optional[list[np.ndarray]] = None,
+                      obs_lut: Optional[list[np.ndarray]] = None,
+                      ) -> None:
+        """One simultaneous RTL-boundary PC tick for any number of layers."""
+        clamps, obs = self._default_clamps_and_obs(
+            x_top, y_bottom, clamp_top, clamp_bottom, clamp_lut, obs_lut
+        )
+        x_prev = [
+            np.where(clamps[idx], obs[idx], layer.x_state)
+            for idx, layer in enumerate(self.layers)
+        ]
+        back_prev = [layer.back_nk.copy() for layer in self.layers]
+
+        for idx, layer in enumerate(self.layers):
+            if idx == self.num_layers - 1:
+                x_up = np.zeros(layer.n, dtype=np.float64)
+            else:
+                x_up = x_prev[idx + 1]
+
+            if idx == 0:
+                back_from_down = np.zeros((layer.k, 0), dtype=np.float64)
+            else:
+                back_from_down = back_prev[idx - 1]
+
+            layer.tick(
+                x_up=x_up,
+                back_from_down=back_from_down,
+                clamp_vec=clamps[idx],
+                obs_vec=obs[idx],
+            )
+
+    def tick(self,
+             x_top: Optional[np.ndarray] = None,
+             y_bottom: Optional[np.ndarray] = None,
+             clamp_top: bool = True,
+             clamp_bottom: bool = False,
+             clamp_lut: Optional[list[np.ndarray]] = None,
+             obs_lut: Optional[list[np.ndarray]] = None,
+             ) -> None:
+        """Alias for tick_parallel; PCNetNLayer is the RTL-boundary path."""
+        self.tick_parallel(x_top, y_bottom, clamp_top, clamp_bottom, clamp_lut, obs_lut)
+
+    @property
+    def x0(self) -> np.ndarray:
+        """Bottom-layer state — the network's output prediction."""
+        return self.layers[0].x_state.copy()

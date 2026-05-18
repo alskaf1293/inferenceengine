@@ -4,6 +4,9 @@ main.py
 
 archive/
 obj_dir/
+__pycache__/
+*.pyc
+runs/synth/*.xml
 
 python_runs/
 python_rtl/python_runs/

@@ -1,0 +1,4 @@
+case,kind,k0,k1,k2,samples,epochs,infer_ticks,learn_ticks,eval_ticks,alpha,gamma,max_abs_error,final_mse,status,data,csv
+cartpole_value_td_batch_seed42,cartpole_value_td,2,16,4,24,2,10,2,16,0.03,0.06,8.20470414e-09,0.242037104,pass,runs/rtl_runner_batch_trace/data/cartpole_value_td_batch_seed42.dat,runs/rtl_runner_batch_trace/cartpole_value_td_batch_seed42.csv
+cartpole_policy_aif_batch_seed42,cartpole_policy_aif,2,16,4,24,2,10,2,16,0.03,0.06,5.7368033e-08,0.004131879,pass,runs/rtl_runner_batch_trace/data/cartpole_policy_aif_batch_seed42.dat,runs/rtl_runner_batch_trace/cartpole_policy_aif_batch_seed42.csv
+pendulum_pc_critic_td_batch_seed42,pendulum_pc_critic_td,1,16,4,24,2,10,2,16,0.03,0.06,3.13335337e-10,0.001333264,pass,runs/rtl_runner_batch_trace/data/pendulum_pc_critic_td_batch_seed42.dat,runs/rtl_runner_batch_trace/pendulum_pc_critic_td_batch_seed42.csv

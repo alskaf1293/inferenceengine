@@ -1,0 +1,6 @@
+case,act_lut,alpha,gamma,tol,max_abs_error,status,csv
+lin_relu_lin_a005_g010,linear/relu/linear,0.05,0.1,5e-06,2.4e-08,pass,runs/rtl_network_trace_sweep/lin_relu_lin_a005_g010.csv
+lin_relu_lin_a002_g005,linear/relu/linear,0.02,0.05,5e-06,2.4e-08,pass,runs/rtl_network_trace_sweep/lin_relu_lin_a002_g005.csv
+lin_relu_lin_a010_g020,linear/relu/linear,0.1,0.2,5e-06,2.4e-08,pass,runs/rtl_network_trace_sweep/lin_relu_lin_a010_g020.csv
+lin_lin_lin_a005_g010,linear/linear/linear,0.05,0.1,5e-06,2.4e-08,pass,runs/rtl_network_trace_sweep/lin_lin_lin_a005_g010.csv
+relu_relu_lin_a005_g010,relu/relu/linear,0.05,0.1,5e-06,2.4e-08,pass,runs/rtl_network_trace_sweep/relu_relu_lin_a005_g010.csv

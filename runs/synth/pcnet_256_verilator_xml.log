@@ -1,0 +1,6 @@
+%Warning-DEPRECATED: Option --xml-only is deprecated, move to --json-only
+                     ... For warning description see https://verilator.org/warn/DEPRECATED?v=5.038
+                     ... Use "/* verilator lint_off DEPRECATED */" and lint_on around source to disable this message.
+- V e r i l a t i o n   R e p o r t: Verilator 5.038 2025-07-08 rev v5.038
+- Verilator: Built from 8.574 MB sources in 50 modules, into 0.000 MB in 0 C++ files needing 0.000 MB
+- Verilator: Walltime 121.089 s (elab=23.112, cvt=83.469, bld=0.000); cpu 121.003 s on 1 threads; alloced 9374.984 MB

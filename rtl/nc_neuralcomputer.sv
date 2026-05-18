@@ -828,6 +828,41 @@ module pc_network_nlayer #(
             .x_state_ieee(x_state_l)
           );
 
+        end else if ((ul == 2) && (NUM_LAYERS > 3)) begin : G_LAYER_INST_L2
+          pc_layer #(
+            .K(K_CUR),
+            .N(N_CUR),
+            .M(M_CUR),
+            .EXP(EXP),
+            .SIG(SIG),
+            .CLAMP_HARD_THIS_LAYER(CLAMP_HARD_THIS),
+            .ACT_THIS_LAYER(ACT_THIS),
+            .THETA_PRESET_IEEE_PER_NEURON(THETA_L2),
+            .X_INIT_IEEE_THIS_LAYER(X_INIT_SEED)
+          ) L (
+            .clk(clk),
+            .rst_n(rst_n),
+            .start_tick(start_tick_int),
+
+            .busy_o(busy_vec[ul]),
+            .done_o(done_vec[ul]),
+
+            .alpha_ieee(alpha_ieee),
+            .gamma_ieee(gamma_ieee),
+
+            .x_set_en_vec(x_set_en_vec_l),
+            .x_obs_ieee_vec(x_obs_ieee_vec_l),
+
+            .x_up_ieee(x_up_l),
+            .back_from_down_ieee(back_from_down_l),
+
+            .back_up_valid_o(back_valid_vec[ul]),
+            .back_matrix_kn_ieee(back_kn_l),
+            .back_matrix_nk_ieee(back_nk_l),
+
+            .x_state_ieee(x_state_l)
+          );
+
         end else begin : G_LAYER_INST_LX
           pc_layer #(
             .K(K_CUR),
@@ -838,8 +873,8 @@ module pc_network_nlayer #(
             .CLAMP_HARD_THIS_LAYER(CLAMP_HARD_THIS),
             .ACT_THIS_LAYER(ACT_THIS),
 
-            // For ul==2 (top), N_CUR is likely 0, so this param won’t be used.
-            // For safety, pass zeros. You can later add THETA_L2 if you ever need it.
+            // Top or unsupported deeper layers keep zero theta presets.
+            // Nonzero L2 presets are enabled above for four-layer networks.
             .THETA_PRESET_IEEE_PER_NEURON('{default:'{default:32'h0000_0000}}),
 
             .X_INIT_IEEE_THIS_LAYER(X_INIT_SEED)

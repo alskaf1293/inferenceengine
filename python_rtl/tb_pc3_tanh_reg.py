@@ -83,7 +83,7 @@ def main():
         alpha     = ALPHA_R,
         seed      = 0,
         rtl_init  = True,
-        gen_k_lut = [8, 16, 8],
+        gen_k_lut = [8, 64, 64],
     )
 
     os.makedirs('python_runs', exist_ok=True)

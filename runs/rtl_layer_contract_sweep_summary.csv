@@ -1,0 +1,8 @@
+case,k,n,m,act,max_abs_error,tol,csv,status
+tile_k2_fanin_256,2,256,1,linear,6.13927841e-11,1e-05,runs/rtl_layer_contract_sweep/tile_k2_fanin_256.csv,pass
+tile_k4_fanin_256,4,256,1,linear,6.13927841e-11,1e-05,runs/rtl_layer_contract_sweep/tile_k4_fanin_256.csv,pass
+tile_k8_fanin_256,8,256,1,linear,6.64964318e-11,1e-05,runs/rtl_layer_contract_sweep/tile_k8_fanin_256.csv,pass
+tile_k2_backflow_256,2,1,256,linear,5.43147326e-11,1e-05,runs/rtl_layer_contract_sweep/tile_k2_backflow_256.csv,pass
+tile_k4_backflow_256,4,1,256,linear,5.99771738e-11,1e-05,runs/rtl_layer_contract_sweep/tile_k4_backflow_256.csv,pass
+tile_k4_balanced_64,4,64,64,linear,1.32992864e-10,1e-05,runs/rtl_layer_contract_sweep/tile_k4_balanced_64.csv,pass
+tile_k4_relu_fanin_256,4,256,1,relu,0,1e-05,runs/rtl_layer_contract_sweep/tile_k4_relu_fanin_256.csv,pass

@@ -1,0 +1,7 @@
+case,act,x_set,clamp_hard,tol,max_abs_error,status,csv
+linear_free,linear,0,0,5e-06,4.91172797e-10,pass,runs/rtl_primitive_sweep/linear_free.csv
+linear_soft_xset,linear,1,0,5e-06,2.94209747e-08,pass,runs/rtl_primitive_sweep/linear_soft_xset.csv
+linear_hard_xset,linear,1,1,5e-06,2.94209747e-08,pass,runs/rtl_primitive_sweep/linear_hard_xset.csv
+relu_free,relu,0,0,5e-06,4.9011612e-10,pass,runs/rtl_primitive_sweep/relu_free.csv
+relu_soft_xset,relu,1,0,5e-06,4.70348357e-10,pass,runs/rtl_primitive_sweep/relu_soft_xset.csv
+relu_hard_xset,relu,1,1,5e-06,4.70348357e-10,pass,runs/rtl_primitive_sweep/relu_hard_xset.csv

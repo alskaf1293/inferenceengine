@@ -1,0 +1,129 @@
+
+ /----------------------------------------------------------------------------\
+ |                                                                            |
+ |  yosys -- Yosys Open SYnthesis Suite                                       |
+ |                                                                            |
+ |  Copyright (C) 2012 - 2019  Clifford Wolf <clifford@clifford.at>           |
+ |                                                                            |
+ |  Permission to use, copy, modify, and/or distribute this software for any  |
+ |  purpose with or without fee is hereby granted, provided that the above    |
+ |  copyright notice and this permission notice appear in all copies.         |
+ |                                                                            |
+ |  THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES  |
+ |  WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF          |
+ |  MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR   |
+ |  ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES    |
+ |  WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN     |
+ |  ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF   |
+ |  OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.            |
+ |                                                                            |
+ \----------------------------------------------------------------------------/
+
+ Yosys 0.9 (git sha1 1979e0b)
+
+
+-- Executing script file `scripts/synth_pcnet_256_yosys.ys' --
+
+1. Executing Verilog-2005 frontend: HardFloat/source/HardFloat_primitives.v
+Parsing SystemVerilog input from `HardFloat/source/HardFloat_primitives.v' to AST representation.
+Generating RTLIL representation for module `\reverse'.
+Generating RTLIL representation for module `\lowMaskHiLo'.
+Generating RTLIL representation for module `\lowMaskLoHi'.
+Generating RTLIL representation for module `\countLeadingZeros'.
+Generating RTLIL representation for module `\compressBy2'.
+Generating RTLIL representation for module `\compressBy4'.
+Successfully finished Verilog frontend.
+
+2. Executing Verilog-2005 frontend: HardFloat/source/HardFloat_consts.vi
+Parsing SystemVerilog input from `HardFloat/source/HardFloat_consts.vi' to AST representation.
+Successfully finished Verilog frontend.
+
+3. Executing Verilog-2005 frontend: HardFloat/source/HardFloat_localFuncs.vi
+Parsing SystemVerilog input from `HardFloat/source/HardFloat_localFuncs.vi' to AST representation.
+Successfully finished Verilog frontend.
+
+4. Executing Verilog-2005 frontend: HardFloat/source/HardFloat_rawFN.v
+Parsing SystemVerilog input from `HardFloat/source/HardFloat_rawFN.v' to AST representation.
+Generating RTLIL representation for module `\recFNToRawFN'.
+Generating RTLIL representation for module `\roundAnyRawFNToRecFN'.
+Generating RTLIL representation for module `\roundRawFNToRecFN'.
+Successfully finished Verilog frontend.
+
+5. Executing Verilog-2005 frontend: HardFloat/source/addRecFN.v
+Parsing SystemVerilog input from `HardFloat/source/addRecFN.v' to AST representation.
+Generating RTLIL representation for module `\addRecFNToRaw'.
+HardFloat/source/addRecFN.v:133: Warning: Range [2:1] select out of bounds on signal `\alignDist': Setting 1 MSB bits to undef.
+Generating RTLIL representation for module `\addRecFN'.
+Successfully finished Verilog frontend.
+
+6. Executing Verilog-2005 frontend: HardFloat/source/compareRecFN.v
+Parsing SystemVerilog input from `HardFloat/source/compareRecFN.v' to AST representation.
+Generating RTLIL representation for module `\compareRecFN'.
+Successfully finished Verilog frontend.
+
+7. Executing Verilog-2005 frontend: HardFloat/source/divSqrtRecFN_small.v
+Parsing SystemVerilog input from `HardFloat/source/divSqrtRecFN_small.v' to AST representation.
+Generating RTLIL representation for module `\divSqrtRecFNToRaw_small'.
+Generating RTLIL representation for module `\divSqrtRecFN_small'.
+Successfully finished Verilog frontend.
+
+8. Executing Verilog-2005 frontend: HardFloat/source/fNToRecFN.v
+Parsing SystemVerilog input from `HardFloat/source/fNToRecFN.v' to AST representation.
+Generating RTLIL representation for module `\fNToRecFN'.
+Successfully finished Verilog frontend.
+
+9. Executing Verilog-2005 frontend: HardFloat/source/iNToRecFN.v
+Parsing SystemVerilog input from `HardFloat/source/iNToRecFN.v' to AST representation.
+Generating RTLIL representation for module `\iNToRawFN'.
+Generating RTLIL representation for module `\iNToRecFN'.
+Successfully finished Verilog frontend.
+
+10. Executing Verilog-2005 frontend: HardFloat/source/isSigNaNRecFN.v
+Parsing SystemVerilog input from `HardFloat/source/isSigNaNRecFN.v' to AST representation.
+Generating RTLIL representation for module `\isSigNaNRecFN'.
+Successfully finished Verilog frontend.
+
+11. Executing Verilog-2005 frontend: HardFloat/source/mulAddRecFN.v
+Parsing SystemVerilog input from `HardFloat/source/mulAddRecFN.v' to AST representation.
+Generating RTLIL representation for module `\mulAddRecFNToRaw_preMul'.
+Generating RTLIL representation for module `\mulAddRecFNToRaw_postMul'.
+HardFloat/source/mulAddRecFN.v:296: Warning: Range [2:1] select out of bounds on signal `\intermed_CDom_CAlignDist': Setting 1 MSB bits to undef.
+Generating RTLIL representation for module `\mulAddRecFNToRaw'.
+Generating RTLIL representation for module `\mulAddRecFN'.
+Successfully finished Verilog frontend.
+
+12. Executing Verilog-2005 frontend: HardFloat/source/mulRecFN.v
+Parsing SystemVerilog input from `HardFloat/source/mulRecFN.v' to AST representation.
+Generating RTLIL representation for module `\mulRecFNToFullRaw'.
+Generating RTLIL representation for module `\mulRecFNToRaw'.
+Generating RTLIL representation for module `\mulRecFN'.
+Successfully finished Verilog frontend.
+
+13. Executing Verilog-2005 frontend: HardFloat/source/recFNToFN.v
+Parsing SystemVerilog input from `HardFloat/source/recFNToFN.v' to AST representation.
+Generating RTLIL representation for module `\recFNToFN'.
+Successfully finished Verilog frontend.
+
+14. Executing Verilog-2005 frontend: HardFloat/source/recFNToIN.v
+Parsing SystemVerilog input from `HardFloat/source/recFNToIN.v' to AST representation.
+Generating RTLIL representation for module `\recFNToIN'.
+HardFloat/source/recFNToIN.v:114: Warning: Range select [-2:0] out of bounds on signal `\unroundedInt': Setting all -1 result bits to undef.
+HardFloat/source/recFNToIN.v:127: Warning: Range [-1:-1] select out of bounds on signal `\unroundedInt': Setting 1 LSB bits to undef.
+Successfully finished Verilog frontend.
+
+15. Executing Verilog-2005 frontend: HardFloat/source/recFNToRecFN.v
+Parsing SystemVerilog input from `HardFloat/source/recFNToRecFN.v' to AST representation.
+Generating RTLIL representation for module `\recFNToRecFN'.
+Successfully finished Verilog frontend.
+
+16. Executing Verilog-2005 frontend: HardFloat/source/8086-SSE/HardFloat_specialize.v
+Parsing SystemVerilog input from `HardFloat/source/8086-SSE/HardFloat_specialize.v' to AST representation.
+Generating RTLIL representation for module `\iNFromException'.
+Generating RTLIL representation for module `\propagateFloatNaN_add'.
+Generating RTLIL representation for module `\propagateFloatNaN_mul'.
+Generating RTLIL representation for module `\propagateFloatNaN_mulAdd'.
+Generating RTLIL representation for module `\propagateFloatNaN_divSqrt'.
+Successfully finished Verilog frontend.
+
+17. Executing Verilog-2005 frontend: rtl/hf_mac32.sv
+rtl/hf_mac32.sv:8: ERROR: syntax error, unexpected TOK_ID, expecting '='

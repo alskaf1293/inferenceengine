@@ -1,0 +1,4 @@
+case,k0,k1,k2,samples,epochs,infer_ticks,learn_ticks,eval_ticks,alpha,gamma,max_abs_error,final_mse,status,csv
+cartpole_value_policy_4_16_2,2,16,4,16,2,10,2,16,0.03,0.06,7.38049913e-10,0.071451252,pass,runs/rtl_task_shape_trace_sweep/cartpole_value_policy_4_16_2.csv
+pendulum_actor_3_16_1,1,16,3,16,2,10,2,16,0.03,0.06,1.20858831e-09,0.139430820,pass,runs/rtl_task_shape_trace_sweep/pendulum_actor_3_16_1.csv
+pendulum_critic_4_16_1,1,16,4,16,2,10,2,16,0.03,0.06,1.28952729e-09,0.094898385,pass,runs/rtl_task_shape_trace_sweep/pendulum_critic_4_16_1.csv

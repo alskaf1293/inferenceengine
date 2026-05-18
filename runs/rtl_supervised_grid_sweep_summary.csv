@@ -1,0 +1,5 @@
+case,k0,k1,k2,samples,epochs,infer_ticks,learn_ticks,eval_ticks,alpha,gamma,max_abs_error,final_mse,status,csv
+grid_3_4_2_s8_e2_i8_l2_v12_a005_g010,3,4,2,8,2,8,2,12,0.05,0.1,2.65814719e-09,0.082509124,pass,runs/rtl_supervised_grid_sweep/grid_3_4_2_s8_e2_i8_l2_v12_a005_g010.csv
+grid_4_8_4_s12_e2_i8_l2_v12_a004_g008,4,8,4,12,2,8,2,12,0.04,0.08,3.09789143e-09,0.093101249,pass,runs/rtl_supervised_grid_sweep/grid_4_8_4_s12_e2_i8_l2_v12_a004_g008.csv
+grid_6_12_6_s16_e2_i10_l2_v16_a003_g006,6,12,6,16,2,10,2,16,0.03,0.06,2.07259142e-09,0.090901162,pass,runs/rtl_supervised_grid_sweep/grid_6_12_6_s16_e2_i10_l2_v16_a003_g006.csv
+grid_8_16_8_s16_e1_i10_l2_v16_a002_g005,8,16,8,16,1,10,2,16,0.02,0.05,1.3349893e-09,0.124669507,pass,runs/rtl_supervised_grid_sweep/grid_8_16_8_s16_e1_i10_l2_v16_a002_g005.csv

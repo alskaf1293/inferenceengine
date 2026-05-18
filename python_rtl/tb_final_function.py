@@ -98,7 +98,7 @@ def main():
         alpha      = ALPHA_R,
         seed       = 0,            # matches gen_theta_init_pkg.py default seed
         rtl_init   = True,         # float32-cast weights to match theta_init_pkg.sv
-        gen_k_lut  = [8, 16, 8],   # full block size used by gen_theta_init_pkg.py
+        gen_k_lut  = [8, 64, 64],   # full block size used by gen_theta_init_pkg.py
     )
 
     os.makedirs('python_runs', exist_ok=True)

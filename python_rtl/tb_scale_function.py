@@ -278,7 +278,9 @@ def run_experiment(K0: int, K1: int, K2: int, csv_path: str,
                    bias_lr_scale: float = 1.0,
                    bias_init_scale: float = 0.0,
                    teacher_kind: str = 'tiled',
-                   teacher_seed: int = 7) -> None:
+                   teacher_seed: int = 7,
+                   schedule: str = 'sequential',
+                   learn_gamma_mode: str = 'frozen') -> None:
 
     rng = np.random.default_rng(seed)
 
@@ -325,6 +327,7 @@ def run_experiment(K0: int, K1: int, K2: int, csv_path: str,
     # exactly match teacher y = W2 @ tanh(W1 @ x + b).
     act_bottom = act_hidden if act_hidden in ('tanh', 'sigmoid') else 'linear'
     print(f'[TB] ACT_BOTTOM={act_bottom}  ACT_HIDDEN={act_hidden}  BIAS_LR_SCALE={bias_lr_scale}  BIAS_INIT_SCALE={bias_init_scale}  TEACHER={teacher_kind}')
+    print(f'[TB] SCHEDULE={schedule}  LEARN_GAMMA_MODE={learn_gamma_mode}')
     print(f'[TB] {"=" * 50}')
 
     gen_k_lut = [max(8, K0), max(16, K1), max(8, K2)]
@@ -357,14 +360,20 @@ def run_experiment(K0: int, K1: int, K2: int, csv_path: str,
         net.layer1.x_state[:] = x_init
         net.layer0.x_state[:] = x_init
 
+    def tick_once(x_top, y_bottom, clamp_top=True, clamp_bottom=False):
+        if schedule == 'parallel':
+            net.tick_parallel(x_top, y_bottom, clamp_top=clamp_top, clamp_bottom=clamp_bottom)
+        else:
+            net.tick(x_top, y_bottom, clamp_top=clamp_top, clamp_bottom=clamp_bottom)
+
     def mse_dataset():
         net.set_rates(alpha=0.0, gamma=gamma)
         acc = 0.0
         for s in range(num_samples):
             reset_hidden()
             for _ in range(eval_settle):
-                net.tick(x_samples[s], y_bottom=None,
-                         clamp_top=True, clamp_bottom=False)
+                tick_once(x_samples[s], y_bottom=None,
+                          clamp_top=True, clamp_bottom=False)
             diff = net.x0 - y_targets[s]
             acc += float(np.dot(diff, diff)) / K0
         return acc / num_samples
@@ -386,14 +395,16 @@ def run_experiment(K0: int, K1: int, K2: int, csv_path: str,
                 # Phase 1: infer to convergence — states free, no weight updates
                 net.set_rates(alpha=0.0, gamma=gamma)
                 for _ in range(infer_ticks):
-                    net.tick(x_samples[s], y_targets[s],
-                             clamp_top=True, clamp_bottom=True)
+                    tick_once(x_samples[s], y_targets[s],
+                              clamp_top=True, clamp_bottom=True)
 
-                # Phase 2: weight update — states frozen (gamma=0), weights updated
-                net.set_rates(alpha=alpha_ep, gamma=0.0)
+                # Phase 2: weight update. The historical Python path freezes
+                # states (gamma=0); RTL testbenches keep gamma active.
+                learn_gamma = gamma if learn_gamma_mode == 'rtl' else 0.0
+                net.set_rates(alpha=alpha_ep, gamma=learn_gamma)
                 for _ in range(learn_ticks):
-                    net.tick(x_samples[s], y_targets[s],
-                             clamp_top=True, clamp_bottom=True)
+                    tick_once(x_samples[s], y_targets[s],
+                              clamp_top=True, clamp_bottom=True)
 
             msep = mse_dataset()
             writer.writerow([ep + 1, f'{msep:.6f}'])
@@ -449,6 +460,10 @@ def main():
                         'deep_tanh = two-hidden-layer tanh MLP (unrealizable, harder)')
     p.add_argument('--teacher-seed', type=int, default=7,
                    help='RNG seed for deep_tanh teacher weights (default: 7)')
+    p.add_argument('--schedule', choices=['sequential', 'parallel'], default='sequential',
+                   help='Network tick schedule: sequential legacy Python path, or parallel RTL boundary timing')
+    p.add_argument('--learn-gamma-mode', choices=['frozen', 'rtl'], default='frozen',
+                   help='Use gamma=0 during learn ticks (legacy), or keep gamma active like RTL testbenches')
     p.add_argument('--width-mult', type=int, default=1,
                    help='Multiply K1 (hidden width) by this factor for more capacity (default: 1)')
     args = p.parse_args()
@@ -537,7 +552,9 @@ def main():
                        bias_lr_scale=bias_lr_scale,
                        bias_init_scale=bias_init_scale,
                        teacher_kind=args.teacher,
-                       teacher_seed=args.teacher_seed)
+                       teacher_seed=args.teacher_seed,
+                       schedule=args.schedule,
+                       learn_gamma_mode=args.learn_gamma_mode)
 
 
 if __name__ == '__main__':

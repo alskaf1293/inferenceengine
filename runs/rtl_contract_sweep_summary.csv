@@ -1,0 +1,9 @@
+case,n,m,act,x_set,clamp_hard,max_abs_error,tol,csv,status
+fanin_64,64,1,linear,0,0,7.31845474e-09,1e-05,runs/rtl_contract_sweep/fanin_64.csv,pass
+fanin_128,128,1,linear,0,0,4.90699772e-10,1e-05,runs/rtl_contract_sweep/fanin_128.csv,pass
+fanin_256,256,1,linear,0,0,5.56695938e-10,1e-05,runs/rtl_contract_sweep/fanin_256.csv,pass
+backflow_64,1,64,linear,0,0,4.65579991e-10,1e-05,runs/rtl_contract_sweep/backflow_64.csv,pass
+backflow_128,1,128,linear,0,0,4.93107259e-10,1e-05,runs/rtl_contract_sweep/backflow_128.csv,pass
+backflow_256,1,256,linear,0,0,4.65579991e-10,1e-05,runs/rtl_contract_sweep/backflow_256.csv,pass
+balanced_64,64,64,linear,0,0,7.31845474e-09,1e-05,runs/rtl_contract_sweep/balanced_64.csv,pass
+relu_fanin_256,256,1,relu,0,0,4.13123607e-10,1e-05,runs/rtl_contract_sweep/relu_fanin_256.csv,pass
